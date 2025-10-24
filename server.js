@@ -1,19 +1,20 @@
-// server.js - A robust signaling server for many-to-many meetings
+// server.js - V2: A robust signaling server for persistent, admin-controlled meetings
 
 const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid'); // We'll use UUID for a secure admin token
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-const rooms = new Map(); // This will store all our rooms
+const rooms = new Map();
 
-console.log(`✅ Signaling server is running on port ${PORT}`);
+console.log(`✅ Signaling server V2 is running on port ${PORT}`);
 
-// Helper function to broadcast a message to everyone in a room
-function broadcast(roomId, message) {
-    if (rooms.has(roomId)) {
-        rooms.get(roomId).participants.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
+function broadcast(roomId, message, excludeId = null) {
+    const room = rooms.get(roomId);
+    if (room) {
+        room.participants.forEach((client, clientId) => {
+            if (clientId !== excludeId && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(message));
             }
         });
@@ -30,66 +31,102 @@ wss.on('connection', (ws) => {
         switch (data.type) {
             case 'create_room':
                 const roomId = Math.random().toString(36).substr(2, 6).toUpperCase();
+                const adminToken = uuidv4(); // Secret token for the admin
                 currentRoomId = roomId;
-                currentClientId = 'admin';
-                ws.id = 'admin';
+                currentClientId = data.username;
+                ws.id = currentClientId;
                 
                 rooms.set(roomId, {
-                    adminId: 'admin',
-                    participants: new Map([['admin', ws]])
+                    adminId: currentClientId,
+                    adminToken: adminToken,
+                    participants: new Map([[currentClientId, ws]])
                 });
                 
-                ws.send(JSON.stringify({ type: 'room_created', roomId, clientId: 'admin' }));
-                console.log(`Room created: ${roomId} by admin`);
+                ws.send(JSON.stringify({ type: 'room_created', roomId, clientId: currentClientId, adminToken }));
+                console.log(`Room created: ${roomId} by ${currentClientId}`);
                 break;
 
             case 'join_room':
-                if (rooms.has(data.roomId)) {
+                const roomToJoin = rooms.get(data.roomId);
+                if (roomToJoin) {
                     currentRoomId = data.roomId;
-                    currentClientId = `user-${Math.random().toString(36).substr(2, 9)}`;
+                    currentClientId = data.username;
                     ws.id = currentClientId;
 
-                    const room = rooms.get(data.roomId);
+                    // Is this the admin rejoining?
+                    if (data.adminToken && data.adminToken === roomToJoin.adminToken) {
+                        console.log(`Admin ${currentClientId} rejoined room ${currentRoomId}`);
+                        isAdmin = true;
+                    } else {
+                        // Announce the new peer to existing participants
+                        broadcast(currentRoomId, { type: 'peer_joined', clientId: currentClientId });
+                    }
                     
-                    broadcast(currentRoomId, { type: 'peer_joined', clientId: currentClientId });
+                    const existingParticipants = Array.from(roomToJoin.participants.keys());
+                    ws.send(JSON.stringify({ 
+                        type: 'existing_participants', 
+                        participants: existingParticipants, 
+                        roomId: currentRoomId, 
+                        clientId: currentClientId,
+                        isAdmin: (currentClientId === roomToJoin.adminId)
+                    }));
 
-                    const existingParticipants = Array.from(room.participants.keys());
-                    ws.send(JSON.stringify({ type: 'existing_participants', participants: existingParticipants, roomId: currentRoomId, clientId: currentClientId }));
-
-                    room.participants.set(currentClientId, ws);
+                    roomToJoin.participants.set(currentClientId, ws);
                     console.log(`${currentClientId} joined room ${currentRoomId}`);
                 } else {
                     ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
+                }
+                break;
+            
+            case 'end_meeting':
+                const roomToEnd = rooms.get(data.roomId);
+                if (roomToEnd && data.adminToken === roomToEnd.adminToken) {
+                    broadcast(data.roomId, { type: 'meeting_ended' });
+                    rooms.delete(data.roomId);
+                    console.log(`Room ${data.roomId} ended by admin.`);
                 }
                 break;
 
             case 'offer':
             case 'answer':
             case 'ice_candidate':
-                if (rooms.has(currentRoomId)) {
-                    const targetClient = rooms.get(currentRoomId).participants.get(data.targetId);
-                    if (targetClient) {
-                        // Add the sender's ID to the message for the recipient
-                        data.fromId = currentClientId;
-                        targetClient.send(JSON.stringify(data));
-                    }
+                const targetClient = rooms.get(currentRoomId)?.participants.get(data.targetId);
+                if (targetClient) {
+                    data.fromId = currentClientId;
+                    targetClient.send(JSON.stringify(data));
+                }
+                break;
+            
+            case 'admin_mute_user':
+                const roomToMute = rooms.get(currentRoomId);
+                if (roomToMute && data.adminToken === roomToMute.adminToken) {
+                    broadcast(currentRoomId, { type: 'force_mute', targetId: data.targetId });
+                }
+                break;
+            
+            case 'chat_message':
+                if (currentRoomId) {
+                    broadcast(currentRoomId, { 
+                        type: 'new_chat_message', 
+                        message: data.message, 
+                        from: currentClientId,
+                        timestamp: new Date().toLocaleTimeString()
+                    });
                 }
                 break;
         }
     });
 
     ws.on('close', () => {
-        if (currentRoomId && currentClientId) {
-            const room = rooms.get(currentRoomId);
-            if (!room) return;
-
-            if (currentClientId === 'admin') {
-                broadcast(currentRoomId, { type: 'meeting_ended' });
-                rooms.delete(currentRoomId);
-                console.log(`Room ${currentRoomId} closed.`);
-            } else {
+        const room = rooms.get(currentRoomId);
+        if (room && currentClientId) {
+            // Only remove participant if they are not the admin. Admin can only leave by ending.
+            if (currentClientId !== room.adminId) {
                 room.participants.delete(currentClientId);
                 broadcast(currentRoomId, { type: 'peer_left', clientId: currentClientId });
+                console.log(`${currentClientId} left room ${currentRoomId}`);
+            } else {
+                console.log(`Admin ${currentClientId} disconnected from ${currentRoomId} (can rejoin).`);
             }
         }
     });
