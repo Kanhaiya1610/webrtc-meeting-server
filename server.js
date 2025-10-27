@@ -246,8 +246,10 @@
 
 
 
-
 // backend/server.js
+// Enhanced signaling server with chat, admin controls, admin persistence (via identity),
+// ICE endpoint, and robust room/participant handling.
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -258,17 +260,26 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 8080;
-const rooms = new Map(); // roomId -> { adminClientId, adminToken, participants: Map(clientId, ws) }
 
-// ----------------------------
-// ICE / STUN endpoint (no secrets)
-// ----------------------------
+// rooms: Map<roomId, RoomState>
+// RoomState: {
+//   adminClientId: string,
+//   adminToken: string,
+//   adminIdentity?: { email: string }, // optional identity used to persist admin
+//   participants: Map<clientId, ParticipantState>
+// }
+// ParticipantState: { ws: WebSocket, username: string, isMuted: boolean, clientId: string, identity?: { email: string } }
+const rooms = new Map();
+
+console.log(`Starting signaling server on port ${PORT}`);
+
+// --- ICE endpoint (simple) ---
 app.get('/ice', (req, res) => {
   res.json({
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
-      // Optional free TURN (for testing only, not 100% reliable)
+      // Free/test TURN for development only (may be unreliable)
       {
         urls: 'turn:relay.metered.ca:80',
         username: 'openai',
@@ -278,146 +289,415 @@ app.get('/ice', (req, res) => {
   });
 });
 
-function broadcast(roomId, message) {
+// Helper: send JSON safely
+function safeSend(ws, obj) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  } catch (e) {
+    // ignore send errors
+    console.error('safeSend error', e);
+  }
+}
+
+// Broadcast to all participants in roomId. Optionally exclude clientId.
+function broadcast(roomId, message, excludeClientId = null) {
   const room = rooms.get(roomId);
   if (!room) return;
-  for (const [_, participant] of room.participants) {
-    if (participant.readyState === WebSocket.OPEN) {
-      participant.send(JSON.stringify(message));
+  const msgStr = JSON.stringify(message);
+  for (const [clientId, participant] of room.participants.entries()) {
+    if (clientId === excludeClientId) continue;
+    const ws = participant.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(msgStr);
+      } catch (e) {
+        console.error('Broadcast send failed for', clientId, e);
+      }
     }
   }
 }
 
+// Build a minimal room participant list for sending to new joiners (exclude requester)
+function getRoomState(roomId, excludeClientId = null) {
+  const room = rooms.get(roomId);
+  if (!room) return [];
+  const list = [];
+  for (const [clientId, p] of room.participants.entries()) {
+    if (clientId === excludeClientId) continue;
+    list.push({
+      clientId,
+      username: p.username,
+      isMuted: !!p.isMuted,
+      identity: p.identity || null
+    });
+  }
+  return list;
+}
+
+// When a participant disconnects/close, clean up and possibly promote admin
+function handleDisconnect(clientId, roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  if (room.participants.has(clientId)) {
+    room.participants.delete(clientId);
+  }
+
+  // Inform others
+  broadcast(roomId, { type: 'peer_left', clientId });
+
+  // If admin left, try to either restore admin to same identity (if someone matches),
+  // or promote the first remaining participant.
+  if (room.adminClientId === clientId) {
+    // Try to find participant with same identity
+    const adminIdentity = room.adminIdentity; // maybe undefined
+    let promoted = null;
+    if (adminIdentity && adminIdentity.email) {
+      for (const [cid, p] of room.participants.entries()) {
+        if (p.identity && p.identity.email === adminIdentity.email) {
+          promoted = cid;
+          break;
+        }
+      }
+    }
+    if (!promoted) {
+      // fallback: pick first participant
+      promoted = room.participants.keys().next().value;
+    }
+
+    if (promoted) {
+      room.adminClientId = promoted;
+      room.adminToken = uuidv4();
+      const p = room.participants.get(promoted);
+      if (p && p.ws && p.ws.readyState === WebSocket.OPEN) {
+        safeSend(p.ws, {
+          type: 'your_info',
+          clientId: promoted,
+          isAdmin: true,
+          adminToken: room.adminToken,
+          roomId
+        });
+      }
+      console.log(`Promoted ${promoted} to admin for room ${roomId}`);
+    } else {
+      // no participants left
+      rooms.delete(roomId);
+      console.log(`Deleted empty room ${roomId}`);
+    }
+  }
+
+  // If room is empty now, delete it
+  if (room && room.participants.size === 0) {
+    rooms.delete(roomId);
+    console.log(`Room ${roomId} removed (empty).`);
+  }
+}
+
+// --- WebSocket handling ---
 wss.on('connection', (ws) => {
-  let currentClientId = uuidv4();
+  const clientId = uuidv4();
   let currentRoomId = null;
+  let currentUsername = `User_${clientId.substring(0, 4)}`;
+  let currentIdentity = null; // optional { email: '...' }
 
-  ws.send(JSON.stringify({ type: 'your_info', clientId: currentClientId }));
+  console.log(`Client connected: ${clientId}`);
 
-  ws.on('message', (message) => {
+  // Immediately inform client of its id
+  safeSend(ws, { type: 'your_info', clientId, isAdmin: false });
+
+  ws.on('message', (raw) => {
     let data;
     try {
-      data = JSON.parse(message);
+      data = JSON.parse(raw);
     } catch (err) {
-      console.error('Invalid JSON:', err);
+      console.error('Invalid JSON from client', clientId, err);
+      safeSend(ws, { type: 'error', message: 'Invalid JSON' });
       return;
     }
 
-    switch (data.type) {
-      case 'create_room': {
-        const roomId = uuidv4().slice(0, 6);
-        const adminToken = uuidv4();
-        rooms.set(roomId, {
-          adminClientId: currentClientId,
-          adminToken,
-          participants: new Map([[currentClientId, ws]])
-        });
-        currentRoomId = roomId;
-        ws.send(
-          JSON.stringify({
-            type: 'room_created',
-            roomId,
-            clientId: currentClientId,
-            isAdmin: true,
-            adminToken
-          })
-        );
-        break;
-      }
+    // If client sends username or identity in any message, update local copy
+    if (data.username && typeof data.username === 'string') {
+      currentUsername = data.username.trim().substring(0, 50);
+    }
+    if (data.identity && typeof data.identity === 'object') {
+      // minimal validation — in production verify signatures
+      currentIdentity = { ...(data.identity) };
+    }
 
-      case 'join_room': {
-        const { roomId } = data;
-        const room = rooms.get(roomId);
-        if (!room) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
+    const type = data.type;
+    // console.log(`Message from ${clientId} type=${type} room=${currentRoomId}`);
+
+    switch (type) {
+      // ---------------------------------------------------------------------
+      case 'create_room': {
+        // create new room, set current client as admin
+        if (currentRoomId) {
+          safeSend(ws, { type: 'error', message: 'Already in a room' });
           return;
         }
-        currentRoomId = roomId;
-        room.participants.set(currentClientId, ws);
-
-        // Notify others
-        broadcast(roomId, {
-          type: 'peer_joined',
-          clientId: currentClientId
+        const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const adminToken = uuidv4();
+        const participants = new Map();
+        participants.set(clientId, {
+          ws,
+          username: currentUsername,
+          isMuted: false,
+          clientId,
+          identity: currentIdentity || null
         });
 
-        ws.send(
-          JSON.stringify({
-            type: 'joined_room',
-            roomId,
-            clientId: currentClientId,
-            isAdmin: false
-          })
-        );
+        const roomState = {
+          adminClientId: clientId,
+          adminToken,
+          adminIdentity: currentIdentity || null,
+          participants
+        };
+        rooms.set(roomId, roomState);
+        currentRoomId = roomId;
+
+        // Send room created + your info including admin token
+        safeSend(ws, {
+          type: 'room_created',
+          roomId,
+          clientId,
+          isAdmin: true,
+          adminToken
+        });
+        safeSend(ws, {
+          type: 'your_info',
+          clientId,
+          isAdmin: true,
+          adminToken,
+          roomId
+        });
+        console.log(`Room ${roomId} created by ${clientId} (${currentUsername})`);
         break;
       }
 
+      // ---------------------------------------------------------------------
+      case 'join_room': {
+        if (currentRoomId) {
+          safeSend(ws, { type: 'error', message: 'Already in a room' });
+          return;
+        }
+        const targetRoomId = (data.roomId || '').toString().toUpperCase();
+        if (!targetRoomId) {
+          safeSend(ws, { type: 'error', message: 'Missing roomId' });
+          return;
+        }
+        const room = rooms.get(targetRoomId);
+        if (!room) {
+          safeSend(ws, { type: 'error', message: 'Room not found' });
+          return;
+        }
+
+        // If reconnect: same clientId already present (rare), replace ws
+        if (room.participants.has(clientId)) {
+          const participant = room.participants.get(clientId);
+          participant.ws = ws;
+          participant.username = currentUsername;
+          participant.identity = currentIdentity || participant.identity;
+          currentRoomId = targetRoomId;
+          // Send your_info
+          const isAdmin = room.adminClientId === clientId;
+          safeSend(ws, { type: 'your_info', clientId, isAdmin, roomId: targetRoomId, adminToken: room.adminToken });
+          // Send current state
+          safeSend(ws, { type: 'room_state', participants: getRoomState(targetRoomId, clientId) });
+          break;
+        }
+
+        // Add new participant
+        room.participants.set(clientId, {
+          ws,
+          username: currentUsername,
+          isMuted: false,
+          clientId,
+          identity: currentIdentity || null
+        });
+        currentRoomId = targetRoomId;
+
+        // Notify existing participants (exclude the new joiner)
+        broadcast(targetRoomId, {
+          type: 'peer_joined',
+          clientId,
+          username: currentUsername
+        }, clientId);
+
+        // Send room state to the newcomer (list of others)
+        safeSend(ws, {
+          type: 'room_state',
+          participants: getRoomState(targetRoomId, clientId)
+        });
+
+        // Determine if this joiner should be admin (identity match)
+        let isAdmin = false;
+        if (room.adminIdentity && currentIdentity && room.adminIdentity.email && currentIdentity.email) {
+          // If identity matches the stored adminIdentity, make them admin (persisted admin)
+          if (room.adminIdentity.email === currentIdentity.email) {
+            room.adminClientId = clientId;
+            room.adminToken = uuidv4();
+            room.participants.get(clientId).isAdmin = true;
+            room.adminIdentity = currentIdentity;
+            isAdmin = true;
+            console.log(`Restored admin rights to ${clientId} in room ${targetRoomId} by identity match`);
+          }
+        } else {
+          // If not identity-based restoration, check if room admin is missing and we can promote
+          isAdmin = room.adminClientId === clientId;
+        }
+
+        // Send your info
+        safeSend(ws, {
+          type: 'your_info',
+          clientId,
+          isAdmin,
+          roomId: targetRoomId,
+          adminToken: isAdmin ? room.adminToken : undefined
+        });
+
+        console.log(`${clientId} (${currentUsername}) joined room ${targetRoomId}`);
+        break;
+      }
+
+      // ---------------------------------------------------------------------
+      // WebRTC signaling messages: offer / answer / ice_candidate
       case 'offer':
       case 'answer':
-      case 'candidate': {
-        const { target, ...payload } = data;
-        const room = rooms.get(currentRoomId);
-        if (room && room.participants.has(target)) {
-          const peer = room.participants.get(target);
-          if (peer.readyState === WebSocket.OPEN) {
-            peer.send(JSON.stringify({ ...payload, from: currentClientId }));
-          }
+      case 'ice_candidate': {
+        // Accept either 'targetClientId' or 'target' for compatibility
+        const targetId = data.targetClientId || data.target;
+        if (!currentRoomId || !targetId) {
+          console.warn('Signaling message missing room or target', { type, currentRoomId, targetId });
+          return;
         }
-        break;
-      }
-
-      case 'end_meeting': {
         const room = rooms.get(currentRoomId);
-        if (
-          room &&
-          room.adminClientId === currentClientId &&
-          data.adminToken === room.adminToken
-        ) {
-          broadcast(currentRoomId, { type: 'meeting_ended' });
-          room.participants.forEach((sock) => sock.close());
-          rooms.delete(currentRoomId);
+        if (!room) return;
+        const target = room.participants.get(targetId);
+        if (target && target.ws && target.ws.readyState === WebSocket.OPEN) {
+          // forward message and include sender info
+          const payload = {
+            type,
+            from: clientId,
+            fromId: clientId,
+            fromUsername: currentUsername,
+            ...data // include sdp, candidate, etc.
+          };
+          // remove target fields before sending
+          delete payload.targetClientId;
+          delete payload.target;
+          safeSend(target.ws, payload);
         } else {
-          ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }));
+          console.warn(`Target ${targetId} not available for signaling from ${clientId}`);
         }
         break;
       }
 
+      // ---------------------------------------------------------------------
+      // Chat messages
+      case 'chat_message': {
+        if (!currentRoomId) return;
+        if (typeof data.message !== 'string') return;
+        const text = data.message.trim().substring(0, 1000);
+        if (!text) return;
+        broadcast(currentRoomId, {
+          type: 'new_chat_message',
+          fromClientId: clientId,
+          fromUsername: currentUsername,
+          message: text,
+          timestamp: formatTimestamp()
+        });
+        break;
+      }
+
+      // ---------------------------------------------------------------------
+      // Admin controls (mute_toggle, mute_all)
+      case 'admin_control': {
+        if (!currentRoomId) return;
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+
+        // Validate admin token
+        if (clientId !== room.adminClientId || data.adminToken !== room.adminToken) {
+          safeSend(ws, { type: 'error', message: 'Unauthorized admin action' });
+          console.warn('Unauthorized admin attempt by', clientId);
+          return;
+        }
+
+        const action = data.action;
+        console.log(`Admin ${clientId} action ${action} in room ${currentRoomId}`);
+
+        if (action === 'mute_toggle' && data.targetClientId) {
+          const target = room.participants.get(data.targetClientId);
+          if (!target) return;
+          const newState = !!data.muteState;
+          target.isMuted = newState;
+          // Notify everyone of mute change
+          broadcast(currentRoomId, {
+            type: 'force_mute',
+            targetClientId: data.targetClientId,
+            muteState: newState
+          });
+        } else if (action === 'mute_all') {
+          for (const [pid, participant] of room.participants.entries()) {
+            if (pid === clientId) continue; // skip admin
+            participant.isMuted = true;
+            safeSend(participant.ws, {
+              type: 'force_mute',
+              targetClientId: pid,
+              muteState: true
+            });
+          }
+          // Optionally notify admin that action completed
+          safeSend(ws, { type: 'action_ack', action: 'mute_all' });
+        } else {
+          console.warn('Unknown admin action', action);
+        }
+        break;
+      }
+
+      // ---------------------------------------------------------------------
+      case 'end_meeting': {
+        if (!currentRoomId) return;
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        // Only admin can end meeting with valid token
+        if (clientId === room.adminClientId && data.adminToken === room.adminToken) {
+          broadcast(currentRoomId, { type: 'meeting_ended' });
+          // Close participant sockets
+          for (const [, participant] of room.participants.entries()) {
+            try {
+              participant.ws.close();
+            } catch (e) {}
+          }
+          rooms.delete(currentRoomId);
+          console.log(`Meeting ${currentRoomId} ended by admin ${clientId}`);
+        } else {
+          safeSend(ws, { type: 'error', message: 'Unauthorized (end_meeting)' });
+        }
+        break;
+      }
+
+      // ---------------------------------------------------------------------
       default:
-        console.log('Unknown message:', data);
-    }
-  });
+        safeSend(ws, { type: 'error', message: 'Unknown message type' });
+        console.warn('Unknown message type from', clientId, data.type);
+    } // end switch
+  }); // end ws.on('message')
 
   ws.on('close', () => {
+    console.log(`Client disconnected: ${clientId}`);
     if (!currentRoomId) return;
-    const room = rooms.get(currentRoomId);
-    if (!room) return;
-
-    room.participants.delete(currentClientId);
-    broadcast(currentRoomId, { type: 'peer_left', clientId: currentClientId });
-
-    // If admin leaves, promote next participant
-    if (room.adminClientId === currentClientId) {
-      const next = room.participants.keys().next().value;
-      if (next) {
-        room.adminClientId = next;
-        room.adminToken = uuidv4();
-        const newAdmin = room.participants.get(next);
-        if (newAdmin && newAdmin.readyState === WebSocket.OPEN) {
-          newAdmin.send(
-            JSON.stringify({
-              type: 'your_info',
-              clientId: next,
-              isAdmin: true,
-              adminToken: room.adminToken,
-              roomId: currentRoomId
-            })
-          );
-        }
-      } else {
-        rooms.delete(currentRoomId);
-      }
-    }
+    handleDisconnect(clientId, currentRoomId);
   });
-});
+
+  ws.on('error', (err) => {
+    console.error('WebSocket error for', clientId, err);
+  });
+}); // end connection
 
 server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+
+// --- Utility: timestamp formatting ---
+function formatTimestamp() {
+  return new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
