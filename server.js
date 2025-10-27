@@ -255,11 +255,15 @@ const http = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
-app.use(cors());
-
-
-
+// Now you can use app
 const app = express();
+
+app.use(cors({
+  origin: 'https://kanhaiya1610.github.io', // your frontend
+  methods: ['GET','POST'],
+  credentials: true
+}));
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
