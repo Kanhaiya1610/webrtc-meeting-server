@@ -254,6 +254,10 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const cors = require('cors');
+app.use(cors());
+
+
 
 const app = express();
 const server = http.createServer(app);
