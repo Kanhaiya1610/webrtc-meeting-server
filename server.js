@@ -250,6 +250,8 @@
 // Enhanced signaling server with chat, admin controls, admin persistence (via identity),
 // ICE endpoint, and robust room/participant handling.
 // Enhanced WebRTC Signaling Server with TURN support and robust connection handling
+// backend/server.js
+// Enhanced WebRTC Signaling Server with robust TURN/STUN configuration
 
 const express = require('express');
 const http = require('http');
@@ -278,29 +280,39 @@ const wss = new WebSocket.Server({
 const PORT = process.env.PORT || 8080;
 
 // Data structures
-// rooms: Map<roomId, RoomState>
-// RoomState: { adminClientId, adminToken, adminIdentity, participants: Map<clientId, ParticipantState> }
-// ParticipantState: { ws, username, isMuted, clientId, identity, lastSeen }
 const rooms = new Map();
+const connections = new Map();
 
-// Connection tracking for health monitoring
-const connections = new Map(); // clientId -> { ws, lastPing }
+console.log(`🚀 Starting Enhanced WebRTC Signaling Server on port ${PORT}`);
 
-console.log(`🚀 Starting WebRTC Signaling Server on port ${PORT}`);
-
-// ===== ICE SERVER CONFIGURATION =====
-// Enhanced ICE configuration with multiple STUN/TURN servers for reliability
+// ===== ENHANCED ICE SERVER CONFIGURATION =====
+// This configuration prioritizes TURN over STUN for better reliability
 app.get('/ice', (req, res) => {
   res.json({
     iceServers: [
-      // Multiple STUN servers for redundancy
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun3.l.google.com:19302' },
-      { urls: 'stun:stun4.l.google.com:19302' },
-      
-      // Free TURN servers for testing (replace with paid service in production)
+      // Primary TURN servers (ExpressTurn) - These will be tried first
+      {
+        urls: [
+          'turn:relay1.expressturn.com:3480'
+        ],
+        username: '000000002076989935',
+        credential: 'byPInHD6SuzB8VIXUHdaOwkZlLM='
+      },
+      {
+        urls: [
+          'turn:relay1.expressturn.com:3478'
+        ],
+        username: '000000002076989935',
+        credential: 'byPInHD6SuzB8VIXUHdaOwkZlLM='
+      },
+      {
+        urls: [
+          'turns:relay1.expressturn.com:443?transport=tcp'
+        ],
+        username: '000000002076989935',
+        credential: 'byPInHD6SuzB8VIXUHdaOwkZlLM='
+      },
+      // Backup TURN servers (OpenRelay)
       {
         urls: 'turn:openrelay.metered.ca:80',
         username: 'openrelayproject',
@@ -315,8 +327,17 @@ app.get('/ice', (req, res) => {
         urls: 'turn:openrelay.metered.ca:443?transport=tcp',
         username: 'openrelayproject',
         credential: 'openrelayproject'
-      }
-    ]
+      },
+      // STUN servers as fallback (Google)
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' }
+    ],
+    // ICE transport policy - try relay first for better success rate
+    iceTransportPolicy: 'all', // 'all' allows both relay and direct
+    iceCandidatePoolSize: 10 // Gather more candidates
   });
 });
 
@@ -442,14 +463,14 @@ function handleDisconnect(clientId, roomId) {
     } else {
       // No participants left, delete room
       rooms.delete(roomId);
-      console.log(`🗑️  Deleted empty room ${roomId}`);
+      console.log(`🗑️ Deleted empty room ${roomId}`);
     }
   }
   
   // Clean up empty rooms
   if (room && room.participants.size === 0) {
     rooms.delete(roomId);
-    console.log(`🗑️  Deleted empty room ${roomId}`);
+    console.log(`🗑️ Deleted empty room ${roomId}`);
   }
   
   // Remove from connection tracking
@@ -750,7 +771,7 @@ wss.on('connection', (ws, req) => {
         // Verify admin token
         if (clientId !== room.adminClientId || data.adminToken !== room.adminToken) {
           safeSend(ws, { type: 'error', message: 'Unauthorized admin action' });
-          console.warn(`⚠️  Unauthorized admin attempt by ${clientId}`);
+          console.warn(`⚠️ Unauthorized admin attempt by ${clientId}`);
           return;
         }
         
@@ -849,7 +870,6 @@ wss.on('connection', (ws, req) => {
 
 // ===== ROOM ID GENERATION =====
 function generateRoomId() {
-  // Generate a unique 6-character room code
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let roomId;
   
@@ -867,7 +887,7 @@ function generateRoomId() {
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
-      console.log('⏱️  Terminating inactive connection');
+      console.log('⏱️ Terminating inactive connection');
       return ws.terminate();
     }
     
@@ -882,7 +902,6 @@ wss.on('close', () => {
 });
 
 // ===== PERIODIC ROOM CLEANUP =====
-// Clean up old empty rooms (in case cleanup failed)
 setInterval(() => {
   const now = Date.now();
   const ROOM_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
@@ -900,5 +919,5 @@ server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`🌐 ICE endpoint: http://localhost:${PORT}/ice`);
-  console.log(`❤️  Health check: http://localhost:${PORT}/health`);
+  console.log(`❤️ Health check: http://localhost:${PORT}/health`);
 });
