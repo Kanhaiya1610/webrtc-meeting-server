@@ -249,221 +249,332 @@
 // backend/server.js
 // Enhanced signaling server with chat, admin controls, admin persistence (via identity),
 // ICE endpoint, and robust room/participant handling.
+// Enhanced WebRTC Signaling Server with TURN support and robust connection handling
 
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
-// Now you can use app
+
 const app = express();
 
+// CORS configuration
 app.use(cors({
-  origin: 'https://kanhaiya1610.github.io', // your frontend
-  methods: ['GET','POST'],
+  origin: ['https://kanhaiya1610.github.io', 'http://localhost:3000', 'http://localhost:5500'],
+  methods: ['GET', 'POST'],
   credentials: true
 }));
 
+app.use(express.json());
+
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ 
+  server,
+  clientTracking: true,
+  perMessageDeflate: false
+});
 
 const PORT = process.env.PORT || 8080;
 
+// Data structures
 // rooms: Map<roomId, RoomState>
-// RoomState: {
-//   adminClientId: string,
-//   adminToken: string,
-//   adminIdentity?: { email: string }, // optional identity used to persist admin
-//   participants: Map<clientId, ParticipantState>
-// }
-// ParticipantState: { ws: WebSocket, username: string, isMuted: boolean, clientId: string, identity?: { email: string } }
+// RoomState: { adminClientId, adminToken, adminIdentity, participants: Map<clientId, ParticipantState> }
+// ParticipantState: { ws, username, isMuted, clientId, identity, lastSeen }
 const rooms = new Map();
 
-console.log(`Starting signaling server on port ${PORT}`);
+// Connection tracking for health monitoring
+const connections = new Map(); // clientId -> { ws, lastPing }
 
-// --- ICE endpoint (simple) ---
+console.log(`🚀 Starting WebRTC Signaling Server on port ${PORT}`);
+
+// ===== ICE SERVER CONFIGURATION =====
+// Enhanced ICE configuration with multiple STUN/TURN servers for reliability
 app.get('/ice', (req, res) => {
   res.json({
     iceServers: [
+      // Multiple STUN servers for redundancy
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
-      // Free/test TURN for development only (may be unreliable)
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
+      
+      // Free TURN servers for testing (replace with paid service in production)
       {
-        urls: 'turn:relay.metered.ca:80',
-        username: 'openai',
-        credential: 'openai'
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
       }
     ]
   });
 });
 
-// Helper: send JSON safely
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    rooms: rooms.size,
+    connections: wss.clients.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ===== UTILITY FUNCTIONS =====
+
 function safeSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  
   try {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-  } catch (e) {
-    // ignore send errors
-    console.error('safeSend error', e);
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch (error) {
+    console.error('Error sending message:', error.message);
+    return false;
   }
 }
 
-// Broadcast to all participants in roomId. Optionally exclude clientId.
 function broadcast(roomId, message, excludeClientId = null) {
   const room = rooms.get(roomId);
   if (!room) return;
+  
   const msgStr = JSON.stringify(message);
+  let successCount = 0;
+  
   for (const [clientId, participant] of room.participants.entries()) {
     if (clientId === excludeClientId) continue;
-    const ws = participant.ws;
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    
+    if (participant.ws && participant.ws.readyState === WebSocket.OPEN) {
       try {
-        ws.send(msgStr);
-      } catch (e) {
-        console.error('Broadcast send failed for', clientId, e);
+        participant.ws.send(msgStr);
+        successCount++;
+      } catch (error) {
+        console.error(`Failed to broadcast to ${clientId}:`, error.message);
       }
     }
   }
+  
+  console.log(`📢 Broadcast to room ${roomId}: ${message.type} (${successCount} recipients)`);
 }
 
-// Build a minimal room participant list for sending to new joiners (exclude requester)
 function getRoomState(roomId, excludeClientId = null) {
   const room = rooms.get(roomId);
   if (!room) return [];
-  const list = [];
+  
+  const participants = [];
   for (const [clientId, p] of room.participants.entries()) {
     if (clientId === excludeClientId) continue;
-    list.push({
+    
+    participants.push({
       clientId,
       username: p.username,
       isMuted: !!p.isMuted,
       identity: p.identity || null
     });
   }
-  return list;
+  
+  return participants;
 }
 
-// When a participant disconnects/close, clean up and possibly promote admin
 function handleDisconnect(clientId, roomId) {
+  console.log(`🔌 Handling disconnect for ${clientId} in room ${roomId}`);
+  
   const room = rooms.get(roomId);
   if (!room) return;
-
+  
+  // Remove participant
   if (room.participants.has(clientId)) {
     room.participants.delete(clientId);
+    console.log(`Removed ${clientId} from room ${roomId}`);
   }
-
-  // Inform others
+  
+  // Notify others
   broadcast(roomId, { type: 'peer_left', clientId });
-
-  // If admin left, try to either restore admin to same identity (if someone matches),
-  // or promote the first remaining participant.
+  
+  // Handle admin transfer
   if (room.adminClientId === clientId) {
-    // Try to find participant with same identity
-    const adminIdentity = room.adminIdentity; // maybe undefined
-    let promoted = null;
+    const adminIdentity = room.adminIdentity;
+    let newAdmin = null;
+    
+    // Try to find someone with same identity
     if (adminIdentity && adminIdentity.email) {
       for (const [cid, p] of room.participants.entries()) {
         if (p.identity && p.identity.email === adminIdentity.email) {
-          promoted = cid;
+          newAdmin = cid;
           break;
         }
       }
     }
-    if (!promoted) {
-      // fallback: pick first participant
-      promoted = room.participants.keys().next().value;
+    
+    // Otherwise, promote first participant
+    if (!newAdmin && room.participants.size > 0) {
+      newAdmin = room.participants.keys().next().value;
     }
-
-    if (promoted) {
-      room.adminClientId = promoted;
+    
+    if (newAdmin) {
+      room.adminClientId = newAdmin;
       room.adminToken = uuidv4();
-      const p = room.participants.get(promoted);
-      if (p && p.ws && p.ws.readyState === WebSocket.OPEN) {
-        safeSend(p.ws, {
+      
+      const newAdminParticipant = room.participants.get(newAdmin);
+      if (newAdminParticipant && newAdminParticipant.ws) {
+        safeSend(newAdminParticipant.ws, {
           type: 'your_info',
-          clientId: promoted,
+          clientId: newAdmin,
           isAdmin: true,
           adminToken: room.adminToken,
           roomId
         });
+        console.log(`👑 Promoted ${newAdmin} to admin in room ${roomId}`);
       }
-      console.log(`Promoted ${promoted} to admin for room ${roomId}`);
     } else {
-      // no participants left
+      // No participants left, delete room
       rooms.delete(roomId);
-      console.log(`Deleted empty room ${roomId}`);
+      console.log(`🗑️  Deleted empty room ${roomId}`);
     }
   }
-
-  // If room is empty now, delete it
+  
+  // Clean up empty rooms
   if (room && room.participants.size === 0) {
     rooms.delete(roomId);
-    console.log(`Room ${roomId} removed (empty).`);
+    console.log(`🗑️  Deleted empty room ${roomId}`);
   }
+  
+  // Remove from connection tracking
+  connections.delete(clientId);
 }
 
-// --- WebSocket handling ---
-wss.on('connection', (ws) => {
+function formatTimestamp() {
+  return new Date().toLocaleTimeString([], { 
+    hour: 'numeric', 
+    minute: '2-digit',
+    hour12: true 
+  });
+}
+
+function validateMessage(data) {
+  if (!data || typeof data !== 'object') {
+    return { valid: false, error: 'Invalid message format' };
+  }
+  
+  if (!data.type || typeof data.type !== 'string') {
+    return { valid: false, error: 'Missing or invalid message type' };
+  }
+  
+  return { valid: true };
+}
+
+// ===== WEBSOCKET CONNECTION HANDLING =====
+
+wss.on('connection', (ws, req) => {
   const clientId = uuidv4();
   let currentRoomId = null;
   let currentUsername = `User_${clientId.substring(0, 4)}`;
-  let currentIdentity = null; // optional { email: '...' }
-
-  console.log(`Client connected: ${clientId}`);
-
-  // Immediately inform client of its id
-  safeSend(ws, { type: 'your_info', clientId, isAdmin: false });
-
+  let currentIdentity = null;
+  
+  // Track connection
+  connections.set(clientId, { ws, lastPing: Date.now() });
+  
+  console.log(`✅ Client connected: ${clientId} (Total: ${wss.clients.size})`);
+  
+  // Send initial info
+  safeSend(ws, { 
+    type: 'your_info', 
+    clientId, 
+    isAdmin: false 
+  });
+  
+  // ===== PING/PONG FOR CONNECTION HEALTH =====
+  ws.isAlive = true;
+  
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    const conn = connections.get(clientId);
+    if (conn) {
+      conn.lastPing = Date.now();
+    }
+  });
+  
+  // ===== MESSAGE HANDLER =====
   ws.on('message', (raw) => {
     let data;
+    
     try {
       data = JSON.parse(raw);
-    } catch (err) {
-      console.error('Invalid JSON from client', clientId, err);
-      safeSend(ws, { type: 'error', message: 'Invalid JSON' });
+    } catch (error) {
+      console.error(`Invalid JSON from ${clientId}:`, error.message);
+      safeSend(ws, { type: 'error', message: 'Invalid JSON format' });
       return;
     }
-
-    // If client sends username or identity in any message, update local copy
+    
+    // Validate message
+    const validation = validateMessage(data);
+    if (!validation.valid) {
+      console.error(`Invalid message from ${clientId}:`, validation.error);
+      safeSend(ws, { type: 'error', message: validation.error });
+      return;
+    }
+    
+    // Update username and identity if provided
     if (data.username && typeof data.username === 'string') {
       currentUsername = data.username.trim().substring(0, 50);
     }
+    
     if (data.identity && typeof data.identity === 'object') {
-      // minimal validation — in production verify signatures
-      currentIdentity = { ...(data.identity) };
+      currentIdentity = { ...data.identity };
     }
-
-    const type = data.type;
-    // console.log(`Message from ${clientId} type=${type} room=${currentRoomId}`);
-
+    
+    const { type } = data;
+    
+    // Log message (except verbose signaling)
+    if (!['ice_candidate', 'offer', 'answer'].includes(type)) {
+      console.log(`📨 ${clientId} (${currentUsername}): ${type}`);
+    }
+    
+    // ===== MESSAGE ROUTING =====
+    
     switch (type) {
-      // ---------------------------------------------------------------------
       case 'create_room': {
-        // create new room, set current client as admin
         if (currentRoomId) {
           safeSend(ws, { type: 'error', message: 'Already in a room' });
           return;
         }
-        const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+        
+        const roomId = generateRoomId();
         const adminToken = uuidv4();
+        
         const participants = new Map();
         participants.set(clientId, {
           ws,
           username: currentUsername,
           isMuted: false,
           clientId,
-          identity: currentIdentity || null
+          identity: currentIdentity,
+          lastSeen: Date.now()
         });
-
-        const roomState = {
+        
+        rooms.set(roomId, {
           adminClientId: clientId,
           adminToken,
-          adminIdentity: currentIdentity || null,
-          participants
-        };
-        rooms.set(roomId, roomState);
+          adminIdentity: currentIdentity,
+          participants,
+          createdAt: Date.now()
+        });
+        
         currentRoomId = roomId;
-
-        // Send room created + your info including admin token
+        
         safeSend(ws, {
           type: 'room_created',
           roomId,
@@ -471,6 +582,7 @@ wss.on('connection', (ws) => {
           isAdmin: true,
           adminToken
         });
+        
         safeSend(ws, {
           type: 'your_info',
           clientId,
@@ -478,83 +590,92 @@ wss.on('connection', (ws) => {
           adminToken,
           roomId
         });
-        console.log(`Room ${roomId} created by ${clientId} (${currentUsername})`);
+        
+        console.log(`🎉 Room ${roomId} created by ${clientId} (${currentUsername})`);
         break;
       }
-
-      // ---------------------------------------------------------------------
+      
       case 'join_room': {
         if (currentRoomId) {
           safeSend(ws, { type: 'error', message: 'Already in a room' });
           return;
         }
+        
         const targetRoomId = (data.roomId || '').toString().toUpperCase();
         if (!targetRoomId) {
-          safeSend(ws, { type: 'error', message: 'Missing roomId' });
+          safeSend(ws, { type: 'error', message: 'Missing room ID' });
           return;
         }
+        
         const room = rooms.get(targetRoomId);
         if (!room) {
           safeSend(ws, { type: 'error', message: 'Room not found' });
           return;
         }
-
-        // If reconnect: same clientId already present (rare), replace ws
+        
+        // Check if reconnecting (same clientId)
         if (room.participants.has(clientId)) {
           const participant = room.participants.get(clientId);
           participant.ws = ws;
           participant.username = currentUsername;
-          participant.identity = currentIdentity || participant.identity;
+          participant.lastSeen = Date.now();
+          
           currentRoomId = targetRoomId;
-          // Send your_info
+          
           const isAdmin = room.adminClientId === clientId;
-          safeSend(ws, { type: 'your_info', clientId, isAdmin, roomId: targetRoomId, adminToken: room.adminToken });
-          // Send current state
-          safeSend(ws, { type: 'room_state', participants: getRoomState(targetRoomId, clientId) });
+          safeSend(ws, {
+            type: 'your_info',
+            clientId,
+            isAdmin,
+            roomId: targetRoomId,
+            adminToken: isAdmin ? room.adminToken : undefined
+          });
+          
+          safeSend(ws, {
+            type: 'room_state',
+            participants: getRoomState(targetRoomId, clientId)
+          });
+          
+          console.log(`🔄 ${clientId} (${currentUsername}) reconnected to room ${targetRoomId}`);
           break;
         }
-
-        // Add new participant
+        
+        // New participant
         room.participants.set(clientId, {
           ws,
           username: currentUsername,
           isMuted: false,
           clientId,
-          identity: currentIdentity || null
+          identity: currentIdentity,
+          lastSeen: Date.now()
         });
+        
         currentRoomId = targetRoomId;
-
-        // Notify existing participants (exclude the new joiner)
+        
+        // Notify existing participants
         broadcast(targetRoomId, {
           type: 'peer_joined',
           clientId,
           username: currentUsername
         }, clientId);
-
-        // Send room state to the newcomer (list of others)
+        
+        // Send room state to newcomer
         safeSend(ws, {
           type: 'room_state',
           participants: getRoomState(targetRoomId, clientId)
         });
-
-        // Determine if this joiner should be admin (identity match)
+        
+        // Check if should be admin (identity match)
         let isAdmin = false;
-        if (room.adminIdentity && currentIdentity && room.adminIdentity.email && currentIdentity.email) {
-          // If identity matches the stored adminIdentity, make them admin (persisted admin)
-          if (room.adminIdentity.email === currentIdentity.email) {
-            room.adminClientId = clientId;
-            room.adminToken = uuidv4();
-            room.participants.get(clientId).isAdmin = true;
-            room.adminIdentity = currentIdentity;
-            isAdmin = true;
-            console.log(`Restored admin rights to ${clientId} in room ${targetRoomId} by identity match`);
-          }
-        } else {
-          // If not identity-based restoration, check if room admin is missing and we can promote
-          isAdmin = room.adminClientId === clientId;
+        if (room.adminIdentity && currentIdentity && 
+            room.adminIdentity.email && currentIdentity.email &&
+            room.adminIdentity.email === currentIdentity.email) {
+          room.adminClientId = clientId;
+          room.adminToken = uuidv4();
+          isAdmin = true;
+          console.log(`👑 Admin rights restored to ${clientId} via identity`);
         }
-
-        // Send your info
+        
         safeSend(ws, {
           type: 'your_info',
           clientId,
@@ -562,150 +683,222 @@ wss.on('connection', (ws) => {
           roomId: targetRoomId,
           adminToken: isAdmin ? room.adminToken : undefined
         });
-
-        console.log(`${clientId} (${currentUsername}) joined room ${targetRoomId}`);
+        
+        console.log(`🎊 ${clientId} (${currentUsername}) joined room ${targetRoomId}`);
         break;
       }
-
-      // ---------------------------------------------------------------------
-      // WebRTC signaling messages: offer / answer / ice_candidate
+      
       case 'offer':
       case 'answer':
       case 'ice_candidate': {
-        // Accept either 'targetClientId' or 'target' for compatibility
         const targetId = data.targetClientId || data.target;
+        
         if (!currentRoomId || !targetId) {
-          console.warn('Signaling message missing room or target', { type, currentRoomId, targetId });
+          console.warn(`${type} from ${clientId}: missing room or target`);
           return;
         }
+        
         const room = rooms.get(currentRoomId);
         if (!room) return;
+        
         const target = room.participants.get(targetId);
-        if (target && target.ws && target.ws.readyState === WebSocket.OPEN) {
-          // forward message and include sender info
-          const payload = {
-            type,
-            from: clientId,
-            fromId: clientId,
-            fromUsername: currentUsername,
-            ...data // include sdp, candidate, etc.
-          };
-          // remove target fields before sending
-          delete payload.targetClientId;
-          delete payload.target;
-          safeSend(target.ws, payload);
-        } else {
-          console.warn(`Target ${targetId} not available for signaling from ${clientId}`);
+        if (!target || !target.ws || target.ws.readyState !== WebSocket.OPEN) {
+          console.warn(`Target ${targetId} not available for ${type}`);
+          return;
         }
+        
+        const payload = {
+          type,
+          from: clientId,
+          fromId: clientId,
+          fromUsername: currentUsername,
+          ...data
+        };
+        
+        delete payload.targetClientId;
+        delete payload.target;
+        
+        safeSend(target.ws, payload);
         break;
       }
-
-      // ---------------------------------------------------------------------
-      // Chat messages
+      
       case 'chat_message': {
         if (!currentRoomId) return;
+        
         if (typeof data.message !== 'string') return;
-        const text = data.message.trim().substring(0, 1000);
-        if (!text) return;
+        
+        const message = data.message.trim().substring(0, 1000);
+        if (!message) return;
+        
         broadcast(currentRoomId, {
           type: 'new_chat_message',
           fromClientId: clientId,
           fromUsername: currentUsername,
-          message: text,
+          message,
           timestamp: formatTimestamp()
         });
+        
         break;
       }
-
-      // ---------------------------------------------------------------------
-      // Admin controls (mute_toggle, mute_all)
+      
       case 'admin_control': {
         if (!currentRoomId) return;
+        
         const room = rooms.get(currentRoomId);
         if (!room) return;
-
-        // Validate admin token
+        
+        // Verify admin token
         if (clientId !== room.adminClientId || data.adminToken !== room.adminToken) {
           safeSend(ws, { type: 'error', message: 'Unauthorized admin action' });
-          console.warn('Unauthorized admin attempt by', clientId);
+          console.warn(`⚠️  Unauthorized admin attempt by ${clientId}`);
           return;
         }
-
+        
         const action = data.action;
-        console.log(`Admin ${clientId} action ${action} in room ${currentRoomId}`);
-
+        console.log(`👮 Admin ${clientId} action: ${action} in room ${currentRoomId}`);
+        
         if (action === 'mute_toggle' && data.targetClientId) {
           const target = room.participants.get(data.targetClientId);
           if (!target) return;
+          
           const newState = !!data.muteState;
           target.isMuted = newState;
-          // Notify everyone of mute change
+          
           broadcast(currentRoomId, {
             type: 'force_mute',
             targetClientId: data.targetClientId,
             muteState: newState
           });
+          
         } else if (action === 'mute_all') {
           for (const [pid, participant] of room.participants.entries()) {
-            if (pid === clientId) continue; // skip admin
+            if (pid === clientId) continue; // Skip admin
+            
             participant.isMuted = true;
-            safeSend(participant.ws, {
-              type: 'force_mute',
-              targetClientId: pid,
-              muteState: true
-            });
+            
+            if (participant.ws && participant.ws.readyState === WebSocket.OPEN) {
+              safeSend(participant.ws, {
+                type: 'force_mute',
+                targetClientId: pid,
+                muteState: true
+              });
+            }
           }
-          // Optionally notify admin that action completed
-          safeSend(ws, { type: 'action_ack', action: 'mute_all' });
-        } else {
-          console.warn('Unknown admin action', action);
+          
+          console.log(`🔇 All participants muted in room ${currentRoomId}`);
         }
+        
         break;
       }
-
-      // ---------------------------------------------------------------------
+      
       case 'end_meeting': {
         if (!currentRoomId) return;
+        
         const room = rooms.get(currentRoomId);
         if (!room) return;
-        // Only admin can end meeting with valid token
-        if (clientId === room.adminClientId && data.adminToken === room.adminToken) {
-          broadcast(currentRoomId, { type: 'meeting_ended' });
-          // Close participant sockets
-          for (const [, participant] of room.participants.entries()) {
-            try {
-              participant.ws.close();
-            } catch (e) {}
-          }
-          rooms.delete(currentRoomId);
-          console.log(`Meeting ${currentRoomId} ended by admin ${clientId}`);
-        } else {
-          safeSend(ws, { type: 'error', message: 'Unauthorized (end_meeting)' });
+        
+        // Verify admin
+        if (clientId !== room.adminClientId || data.adminToken !== room.adminToken) {
+          safeSend(ws, { type: 'error', message: 'Unauthorized' });
+          return;
         }
+        
+        console.log(`🛑 Meeting ${currentRoomId} ended by admin ${clientId}`);
+        
+        // Notify all participants
+        broadcast(currentRoomId, { type: 'meeting_ended' });
+        
+        // Close all connections
+        for (const [, participant] of room.participants.entries()) {
+          try {
+            if (participant.ws && participant.ws.readyState === WebSocket.OPEN) {
+              participant.ws.close();
+            }
+          } catch (error) {
+            console.error('Error closing participant connection:', error);
+          }
+        }
+        
+        // Delete room
+        rooms.delete(currentRoomId);
         break;
       }
-
-      // ---------------------------------------------------------------------
+      
       default:
+        console.warn(`Unknown message type: ${type} from ${clientId}`);
         safeSend(ws, { type: 'error', message: 'Unknown message type' });
-        console.warn('Unknown message type from', clientId, data.type);
-    } // end switch
-  }); // end ws.on('message')
-
+    }
+  });
+  
+  // ===== DISCONNECT HANDLER =====
   ws.on('close', () => {
-    console.log(`Client disconnected: ${clientId}`);
-    if (!currentRoomId) return;
-    handleDisconnect(clientId, currentRoomId);
+    console.log(`❌ Client disconnected: ${clientId}`);
+    
+    if (currentRoomId) {
+      handleDisconnect(clientId, currentRoomId);
+    }
+    
+    connections.delete(clientId);
   });
-
-  ws.on('error', (err) => {
-    console.error('WebSocket error for', clientId, err);
+  
+  // ===== ERROR HANDLER =====
+  ws.on('error', (error) => {
+    console.error(`WebSocket error for ${clientId}:`, error.message);
   });
-}); // end connection
+});
 
-server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-
-// --- Utility: timestamp formatting ---
-function formatTimestamp() {
-  return new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+// ===== ROOM ID GENERATION =====
+function generateRoomId() {
+  // Generate a unique 6-character room code
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let roomId;
+  
+  do {
+    roomId = '';
+    for (let i = 0; i < 6; i++) {
+      roomId += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+  } while (rooms.has(roomId));
+  
+  return roomId;
 }
+
+// ===== HEARTBEAT / PING INTERVAL =====
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log('⏱️  Terminating inactive connection');
+      return ws.terminate();
+    }
+    
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000); // Every 30 seconds
+
+// ===== CLEANUP ON SERVER SHUTDOWN =====
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
+});
+
+// ===== PERIODIC ROOM CLEANUP =====
+// Clean up old empty rooms (in case cleanup failed)
+setInterval(() => {
+  const now = Date.now();
+  const ROOM_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
+  
+  for (const [roomId, room] of rooms.entries()) {
+    if (room.participants.size === 0 && (now - room.createdAt) > ROOM_TIMEOUT) {
+      rooms.delete(roomId);
+      console.log(`🧹 Cleaned up old empty room: ${roomId}`);
+    }
+  }
+}, 60 * 60 * 1000); // Every hour
+
+// ===== START SERVER =====
+server.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
+  console.log(`🌐 ICE endpoint: http://localhost:${PORT}/ice`);
+  console.log(`❤️  Health check: http://localhost:${PORT}/health`);
+});
