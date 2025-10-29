@@ -133,7 +133,10 @@ function broadcast(roomId, message, excludeClientId = null) {
     }
   }
   
-  console.log(`📢 Broadcast to room ${roomId}: ${message.type} (${successCount} recipients)`);
+  // Don't log spammy messages like captions
+  if (message.type !== 'caption') {
+    console.log(`📢 Broadcast to room ${roomId}: ${message.type} (${successCount} recipients)`);
+  }
 }
 
 function getRoomState(roomId, excludeClientId = null) {
@@ -305,7 +308,7 @@ wss.on('connection', (ws, req) => {
     const { type } = data;
     
     // Log message (except verbose signaling)
-    if (!['ice_candidate', 'offer', 'answer'].includes(type)) {
+    if (!['ice_candidate', 'offer', 'answer', 'caption'].includes(type)) {
       console.log(`📨 ${clientId} (${currentUsername}): ${type}`);
     }
     
@@ -506,6 +509,31 @@ wss.on('connection', (ws, req) => {
         
         break;
       }
+
+      // ===============================================
+      // ===== THIS IS THE NEWLY ADDED BLOCK =====
+      // ===============================================
+      case 'caption': {
+        if (!currentRoomId) return;
+        
+        // Check for text
+        if (typeof data.text !== 'string') return;
+        
+        // Broadcast the caption to everyone else
+        broadcast(currentRoomId, {
+          type: 'caption',
+          fromClientId: clientId,
+          fromUsername: currentUsername,
+          text: data.text,
+          isFinal: !!data.isFinal, // Ensure boolean
+          language: data.language
+        }, clientId); // Exclude the sender
+        
+        break;
+      }
+      // ===============================================
+      // ===== END OF NEWLY ADDED BLOCK =====
+      // ===============================================
       
       case 'admin_control': {
         if (!currentRoomId) return;
