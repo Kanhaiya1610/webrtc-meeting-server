@@ -9,7 +9,7 @@ const app = express();
 // CORS configuration
 app.use(cors({
   origin: ['https://kanhaiya1610.github.io', 'http://localhost:3000', 'http://localhost:5500'],
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST' , 'OPTIONS' , 'PUT', 'DELETE'],
   credentials: true
 }));
 
