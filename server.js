@@ -1,8 +1,12 @@
+// Load environment variables from .env file
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
+const axios = require('axios'); // Import axios for making HTTP requests
 
 const app = express();
 
@@ -23,6 +27,8 @@ const wss = new WebSocket.Server({
 });
 
 const PORT = process.env.PORT || 8080;
+// Get Gemini API Key from environment variables
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // Data structures
 const rooms = new Map();
@@ -96,6 +102,81 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// ===== NEW: SECURE TRANSLATION ENDPOINT =====
+// Available languages (for prompt generation)
+const CAPTION_LANGUAGES = {
+  'en-US': 'English (US)',
+  'en-GB': 'English (UK)',
+  'es-ES': 'Spanish (Spain)',
+  'es-MX': 'Spanish (Mexico)',
+  'fr-FR': 'French',
+  'de-DE': 'German',
+  'it-IT': 'Italian',
+  'pt-BR': 'Portuguese (Brazil)',
+  'pt-PT': 'Portuguese (Portugal)',
+  'ru-RU': 'Russian',
+  'ja-JP': 'Japanese',
+  'ko-KR': 'Korean',
+  'zh-CN': 'Chinese (Simplified)',
+  'zh-TW': 'Chinese (Traditional)',
+  'hi-IN': 'Hindi',
+  'ar-SA': 'Arabic',
+  'nl-NL': 'Dutch',
+  'pl-PL': 'Polish',
+  'tr-TR': 'Turkish',
+  'sv-SE': 'Swedish'
+};
+
+app.post('/translate', async (req, res) => {
+  if (!GEMINI_API_KEY) {
+    console.error('GEMINI_API_KEY is not set.');
+    return res.status(500).json({ error: 'Translation service is not configured.' });
+  }
+
+  const { text, sourceLang, targetLang } = req.body;
+
+  if (!text || !sourceLang || !targetLang) {
+    return res.status(400).json({ error: 'Missing required parameters.' });
+  }
+
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
+  
+  // Get full language names for a better prompt
+  const sourceLangName = CAPTION_LANGUAGES[sourceLang] || sourceLang;
+  const targetLangName = CAPTION_LANGUAGES[targetLang] || targetLang;
+
+  const prompt = `Translate the following text from ${sourceLangName} to ${targetLangName}. Respond with *only* the translated text, no other commentary, labels, or quotation marks: "${text}"`;
+  
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+  };
+
+  try {
+    const geminiResponse = await axios.post(apiUrl, payload, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+
+    const candidate = geminiResponse.data.candidates?.[0];
+    let translatedText = candidate?.content?.parts?.[0]?.text;
+
+    if (translatedText) {
+      // Clean the response
+      translatedText = translatedText.trim().replace(/^"|"$/g, '');
+      res.json({ translatedText: translatedText });
+    } else {
+      console.error('Invalid response structure from Gemini:', geminiResponse.data);
+      throw new Error('Invalid API response structure');
+    }
+  } catch (error) {
+    console.error('Gemini API call failed:', error.message);
+    if (error.response) {
+      console.error('Gemini Error Data:', error.response.data);
+    }
+    res.status(500).json({ error: 'Translation failed' });
+  }
+});
+
 
 // ===== UTILITY FUNCTIONS =====
 
@@ -795,5 +876,10 @@ server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`🌐 ICE endpoint: http://localhost:${PORT}/ice`);
+  console.log(`🔐 Translate endpoint: http://localhost:${PORT}/translate`);
   console.log(`❤️ Health check: http://localhost:${PORT}/health`);
+
+  if (!GEMINI_API_KEY) {
+    console.warn('⚠️ WARNING: GEMINI_API_KEY is not set in .env file. Translation will fail.');
+  }
 });
