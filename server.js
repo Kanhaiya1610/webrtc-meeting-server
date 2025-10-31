@@ -128,6 +128,8 @@ const CAPTION_LANGUAGES = {
   'sv-SE': 'Swedish'
 };
 
+// translation endpoint
+
 app.post('/translate', async (req, res) => {
   if (!GEMINI_API_KEY) {
     console.error('GEMINI_API_KEY is not set.');
@@ -139,17 +141,33 @@ app.post('/translate', async (req, res) => {
   if (!text || !sourceLang || !targetLang) {
     return res.status(400).json({ error: 'Missing required parameters.' });
   }
-
-  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
   
-  // Get full language names for a better prompt
+  // The API endpoint has been updated in your file, this is just for reference.
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`;
+  
   const sourceLangName = CAPTION_LANGUAGES[sourceLang] || sourceLang;
   const targetLangName = CAPTION_LANGUAGES[targetLang] || targetLang;
 
-  const prompt = `Translate the following text from ${sourceLangName} to ${targetLangName}. Respond with *only* the translated text, no other commentary, labels, or quotation marks: "${text}"`;
+  // --- IMPROVED PROMPT ---
+  // This prompt is more direct and tells the model exactly what to do and what *not* to do.
+  const prompt = `Translate the following text from ${sourceLangName} to ${targetLangName}. 
+  RULES:
+  - Respond ONLY with the translated text.
+  - Do NOT include any extra explanations, labels, or quotation marks.
+  - Do NOT say "Here is the translation:".
+  
+  TEXT TO TRANSLATE:
+  "${text}"`;
   
   const payload = {
     contents: [{ parts: [{ text: prompt }] }],
+    // Added safety settings for more predictable output
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+    ]
   };
 
   try {
@@ -161,19 +179,21 @@ app.post('/translate', async (req, res) => {
     let translatedText = candidate?.content?.parts?.[0]?.text;
 
     if (translatedText) {
-      // Clean the response
+      // Clean the response just in case
       translatedText = translatedText.trim().replace(/^"|"$/g, '');
       res.json({ translatedText: translatedText });
     } else {
       console.error('Invalid response structure from Gemini:', geminiResponse.data);
-      throw new Error('Invalid API response structure');
+      // Send the original text back on failure so the user at least sees something.
+      res.status(500).json({ translatedText: `${text} (Translation Failed)` });
     }
   } catch (error) {
     console.error('Gemini API call failed:', error.message);
     if (error.response) {
-      console.error('Gemini Error Data:', error.response.data);
+      console.error('Gemini Error Data:', JSON.stringify(error.response.data, null, 2));
     }
-    res.status(500).json({ error: 'Translation failed' });
+    // Send the original text back on failure.
+    res.status(500).json({ translatedText: `${text} (Translation Failed)` });
   }
 });
 
