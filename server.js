@@ -23,7 +23,7 @@ const PORT = Number.isInteger(configuredPort) && configuredPort >= 0 ? configure
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const MAX_PARTICIPANTS = clampNumber(process.env.MAX_PARTICIPANTS, 2, 100, 25);
 const ROOM_IDLE_TIMEOUT_MS = clampNumber(process.env.ROOM_IDLE_TIMEOUT_MS, 60_000, 7 * 24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000);
 const DISCONNECT_GRACE_MS = clampNumber(process.env.DISCONNECT_GRACE_MS, 5_000, 5 * 60 * 1000, 30_000);
