@@ -3,14 +3,21 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js",
+    "test": "node --test",
+    "audit:prod": "npm audit --omit=dev"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "uuid": "^9.0.1",
-    "ws": "^8.17.0",
-    "axios": "^1.6.8",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "google-auth-library": "^10.4.0",
+    "helmet": "^8.1.0",
+    "ws": "^8.18.3"
   }
 }
