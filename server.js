@@ -121,6 +121,7 @@ function parseIceServers() {
 const iceServers = parseIceServers();
 
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({
   origin(origin, callback) {
