@@ -73,6 +73,8 @@ const rooms = new Map();
 const connections = new Map();
 const sessions = new Map();
 const translationUsage = new Map();
+const translationMemoryCache = new Map();
+const MAX_TRANSLATION_CACHE_SIZE = 1000;
 const connectionAttempts = new Map();
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
@@ -214,29 +216,35 @@ app.post('/translate', translationLimiter, async (req, res) => {
     return sendJsonError(res, 400, 'Invalid translation request');
   }
 
+  const trimmedText = text.trim();
+  if (sourceLang === targetLang) {
+    return res.json({ translatedText: trimmedText });
+  }
+
+  const cacheKey = `${sourceLang}->${targetLang}:${trimmedText.toLowerCase()}`;
+  if (translationMemoryCache.has(cacheKey)) {
+    return res.json({ translatedText: translationMemoryCache.get(cacheKey) });
+  }
+
   const usage = translationUsage.get(session.user.sub) || { windowStartedAt: Date.now(), count: 0 };
   if (Date.now() - usage.windowStartedAt >= 60_000) {
     usage.windowStartedAt = Date.now();
     usage.count = 0;
   }
-  if (usage.count >= 20) return sendJsonError(res, 429, 'Translation quota exceeded for this user');
+  if (usage.count >= 60) return sendJsonError(res, 429, 'Translation quota exceeded for this user');
   usage.count += 1;
   translationUsage.set(session.user.sub, usage);
-
-  if (sourceLang === targetLang) {
-    return res.json({ translatedText: text.trim() });
-  }
 
   const sourceName = CAPTION_LANGUAGES[sourceLang];
   const targetName = CAPTION_LANGUAGES[targetLang];
   const prompt = [
-    `Translate the following text from ${sourceName} to ${targetName}.`,
-    'Return only the translation. Do not add explanations, labels, quotation marks, or commentary.',
-    `Text: ${JSON.stringify(text.trim())}`
+    `Translate the following spoken conversation text directly from ${sourceName} to ${targetName}.`,
+    'Return ONLY the direct translation. Do not add quotes, markdown formatting, explanations, or commentary.',
+    `Text: ${JSON.stringify(trimmedText)}`
   ].join('\n');
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12_000);
+  const timeout = setTimeout(() => controller.abort(), 8_000);
 
   try {
     const response = await fetch(
@@ -247,7 +255,13 @@ app.post('/translate', translationLimiter, async (req, res) => {
           'Content-Type': 'application/json',
           'x-goog-api-key': GEMINI_API_KEY
         },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 200
+          }
+        }),
         signal: controller.signal
       }
     );
@@ -260,6 +274,13 @@ app.post('/translate', translationLimiter, async (req, res) => {
 
     const translatedText = payload?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
     if (!translatedText) return sendJsonError(res, 502, 'Translation provider returned no text');
+
+    if (translationMemoryCache.size >= MAX_TRANSLATION_CACHE_SIZE) {
+      const oldestKey = translationMemoryCache.keys().next().value;
+      translationMemoryCache.delete(oldestKey);
+    }
+    translationMemoryCache.set(cacheKey, translatedText);
+
     return res.json({ translatedText });
   } catch (error) {
     console.error('Translation request failed:', error.name === 'AbortError' ? 'timeout' : error.message);
@@ -288,7 +309,7 @@ function broadcast(room, message, excludedClientId = null) {
   }
 }
 
-function participantState(participant) {
+function participantState(participant, room = null) {
   return {
     clientId: participant.clientId,
     username: participant.user.name,
@@ -297,6 +318,7 @@ function participantState(participant) {
     isAdminMuted: Boolean(participant.isAdminMuted),
     handRaised: Boolean(participant.handRaised),
     isCameraOff: Boolean(participant.isCameraOff),
+    isHost: Boolean(room && room.adminClientId === participant.clientId),
     connected: Boolean(participant.ws)
   };
 }
@@ -304,7 +326,7 @@ function participantState(participant) {
 function getRoomState(room, excludedClientId = null) {
   return Array.from(room.participants.values())
     .filter(participant => participant.clientId !== excludedClientId)
-    .map(participantState);
+    .map(participant => participantState(participant, room));
 }
 
 function touchRoom(room) {
@@ -531,7 +553,7 @@ async function handleMessage(state, data) {
       rooms.set(roomId, room);
       state.roomId = roomId;
 
-      safeSend(state.ws, { type: 'room_created', roomId, resumeToken: participant.resumeToken });
+      safeSend(state.ws, { type: 'room_created', roomId, adminClientId: room.adminClientId, resumeToken: participant.resumeToken });
       sendYourInfo(state, room);
       return;
     }
@@ -549,9 +571,9 @@ async function handleMessage(state, data) {
       state.roomId = roomId;
       touchRoom(room);
 
-      broadcast(room, { type: 'peer_joined', ...participantState(participant) }, state.clientId);
-      safeSend(state.ws, { type: 'room_joined', roomId, resumeToken: participant.resumeToken });
-      safeSend(state.ws, { type: 'room_state', participants: getRoomState(room, state.clientId) });
+      broadcast(room, { type: 'peer_joined', ...participantState(participant, room) }, state.clientId);
+      safeSend(state.ws, { type: 'room_joined', roomId, adminClientId: room.adminClientId, resumeToken: participant.resumeToken });
+      safeSend(state.ws, { type: 'room_state', adminClientId: room.adminClientId, participants: getRoomState(room, state.clientId) });
       sendYourInfo(state, room);
       return;
     }
@@ -578,8 +600,8 @@ async function handleMessage(state, data) {
       state.roomId = room.roomId;
       touchRoom(room);
 
-      safeSend(state.ws, { type: 'room_resumed', roomId: room.roomId, resumeToken: participant.resumeToken });
-      safeSend(state.ws, { type: 'room_state', participants: getRoomState(room, state.clientId) });
+      safeSend(state.ws, { type: 'room_resumed', roomId: room.roomId, adminClientId: room.adminClientId, resumeToken: participant.resumeToken });
+      safeSend(state.ws, { type: 'room_state', adminClientId: room.adminClientId, participants: getRoomState(room, state.clientId) });
       sendYourInfo(state, room);
       broadcast(room, { type: 'peer_reconnected', ...participantState(participant) }, state.clientId);
       return;
