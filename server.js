@@ -1642,8 +1642,12 @@ wss.on('connection', (ws, request) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reasonBuffer) => {
     if (state.authTimer) clearTimeout(state.authTimer);
+    const reason = reasonBuffer?.toString() || '';
+    if (![1000, 1005].includes(code)) {
+      console.warn('Meeting WebSocket closed:', { clientId: state.clientId, code, reason: reason || 'none', authenticated: state.authenticated });
+    }
     cancelJoinRequestForState(state, 'REQUESTER_DISCONNECTED');
     const isCurrentConnection = connections.get(state.clientId) === state;
     if (isCurrentConnection) connections.delete(state.clientId);
