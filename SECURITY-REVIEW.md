@@ -68,6 +68,9 @@ room membership and host authorization for every state-changing operation.
 - JSON request bodies are limited to 32 KB.
 - HTTP and translation rate limits are enabled.
 - Translation requires a server-issued session and has per-user quotas.
+- Host-only meeting summaries use one bounded, server-memory transcript snapshot
+  per room and one Groq chat-completions call; raw audio, chat, and private
+  notes are excluded.
 - Groq fallback transcription requires a server-issued session, room membership,
   bounded raw audio chunks, and per-user request limits.
 - The Groq API key is read only from the server environment and is never sent
@@ -93,6 +96,8 @@ room membership and host authorization for every state-changing operation.
 - Recording and screen sharing send participant notifications.
 - A participant's own caption transcription is not rendered locally; the
   server broadcasts captions only to the other room participants.
+- Shared-screen presentation uses a fit-to-stage layout with local pin and
+  movable presenter-overlay controls; browser fullscreen is not required.
 - Meeting notes stay in browser-local storage and are never sent over signaling.
 - Background filters run client-side and fall back to the raw camera if the
   segmentation runtime is unavailable.
@@ -120,6 +125,8 @@ The integration tests cover:
 7. Resumed HTTP sessions retaining their bound client identity.
 8. Host admission, one-use grants, direct-join rejection, and host-token
    authorization.
+9. Host-only, one-call Groq summary generation and delivery to all current
+   participants without exposing the transcript.
 
 The meeting client passes JavaScript syntax checks with `node --check` for
 `main.js` and `config.js`.
@@ -178,6 +185,9 @@ These checks must be completed against the actual deployed services:
 - The Groq fallback uploads short microphone chunks to Groq only when browser
   speech recognition is unavailable or fails. Audio is held in memory only for
   the request and should not be logged or persisted by this application.
+- A host summary request uploads bounded final caption text to Groq. The
+  transcript is ephemeral process memory, is never sent to clients, and is
+  discarded when the room is disposed. Provider output is escaped as chat text.
 - A participant can always use an operating-system screen recorder or capture
   media that their browser has already received. Web applications cannot fully
   prevent that.

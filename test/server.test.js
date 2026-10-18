@@ -170,12 +170,12 @@ test('caption transcription preflight allows the client upload headers', async (
     headers: {
       Origin: 'http://localhost:5500',
       'Access-Control-Request-Method': 'POST',
-      'Access-Control-Request-Headers': 'authorization,content-type,x-caption-language,x-caption-chunk'
+      'Access-Control-Request-Headers': 'authorization,content-type,x-caption-language,x-caption-chunk,x-caption-session'
     }
   });
   assert.equal(response.status, 204);
   const allowedHeaders = response.headers.get('access-control-allow-headers') || '';
-  for (const header of ['authorization', 'content-type', 'x-caption-language', 'x-caption-chunk']) {
+  for (const header of ['authorization', 'content-type', 'x-caption-language', 'x-caption-chunk', 'x-caption-session']) {
     assert.match(allowedHeaders.toLowerCase(), new RegExp(`\\b${header}\\b`));
   }
 });
@@ -388,4 +388,85 @@ test('host admission is required before joining a room', async () => {
   await joinedPromise;
   await closeSocket(host.ws);
   await closeSocket(guest.ws);
+});
+
+
+test('host can generate one Groq meeting summary and publish it to participants', async () => {
+  const host = await openAuthenticatedSocket('summary-host');
+  const roomPromise = waitForWebSocketMessage(host.ws, message => message.type === 'room_created');
+  const hostInfoPromise = waitForWebSocketMessage(host.ws, message => message.type === 'your_info' && message.isAdmin && message.adminToken);
+  host.ws.send(JSON.stringify({ type: 'create_room' }));
+  const room = await roomPromise;
+  const hostInfo = await hostInfoPromise;
+
+  const guest = await openAuthenticatedSocket('summary-guest');
+  const preparedPromise = waitForWebSocketMessage(guest.ws, message => message.type === 'room_prepared');
+  guest.ws.send(JSON.stringify({ type: 'prepare_room', action: 'join', roomId: room.roomId }));
+  await preparedPromise;
+  const pendingPromise = waitForWebSocketMessage(guest.ws, message => message.type === 'join_request_pending');
+  const requestPromise = waitForWebSocketMessage(host.ws, message => message.type === 'join_request_received');
+  guest.ws.send(JSON.stringify({ type: 'request_join', roomId: room.roomId }));
+  const request = await requestPromise;
+  await pendingPromise;
+  const admittedPromise = waitForWebSocketMessage(guest.ws, message => message.type === 'join_admitted');
+  host.ws.send(JSON.stringify({ type: 'admit_join_request', requestId: request.requestId, adminToken: hostInfo.adminToken }));
+  const admitted = await admittedPromise;
+  const joinedPromise = waitForWebSocketMessage(guest.ws, message => message.type === 'room_joined');
+  guest.ws.send(JSON.stringify({ type: 'join_room', roomId: room.roomId, admissionToken: admitted.admissionToken }));
+  await joinedPromise;
+
+  const originalFetch = global.fetch;
+  let providerRequest;
+  global.fetch = async (url, options) => {
+    if (url === 'https://api.groq.com/openai/v1/chat/completions') {
+      providerRequest = { url, options };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: 'Summary\n\nDecisions\n- Test decision' } }] })
+      };
+    }
+    return originalFetch(url, options);
+  };
+
+  try {
+    const guestCaptionPromise = waitForWebSocketMessage(guest.ws, message => message.type === 'caption');
+    host.ws.send(JSON.stringify({
+      type: 'caption',
+      captionId: 'summary-caption-1',
+      text: 'We decided to ship the update on Friday.',
+      language: 'en-US',
+      isFinal: true
+    }));
+    await guestCaptionPromise;
+
+    const generatingPromise = waitForWebSocketMessage(host.ws, message => message.type === 'summary_status' && message.state === 'generating');
+    const hostChatPromise = waitForWebSocketMessage(host.ws, message => message.type === 'new_chat_message' && message.messageKind === 'meeting_summary');
+    const guestChatPromise = waitForWebSocketMessage(guest.ws, message => message.type === 'new_chat_message' && message.messageKind === 'meeting_summary');
+    const publishedPromise = waitForWebSocketMessage(host.ws, message => message.type === 'summary_status' && message.state === 'published');
+    host.ws.send(JSON.stringify({ type: 'request_meeting_summary', adminToken: hostInfo.adminToken }));
+    await generatingPromise;
+    const [hostChat, guestChat, published] = await Promise.all([hostChatPromise, guestChatPromise, publishedPromise]);
+
+    assert.equal(published.state, 'published');
+    assert.equal(hostChat.fromUsername, 'Meet Clone');
+    assert.equal(hostChat.fromClientId, null);
+    assert.equal(guestChat.message, hostChat.message);
+    assert.match(hostChat.message, /Test decision/);
+
+    const requestBody = JSON.parse(providerRequest.options.body);
+    assert.equal(requestBody.model, 'openai/gpt-oss-120b');
+    assert.equal(requestBody.stream, false);
+    assert.match(requestBody.messages[1].content, /ship the update on Friday/);
+    assert.doesNotMatch(requestBody.messages[1].content, /summary-host@example\.test/);
+    assert.doesNotMatch(requestBody.messages[1].content, /adminToken/);
+
+    const duplicateErrorPromise = waitForWebSocketMessage(host.ws, message => message.type === 'error' && message.code === 'SUMMARY_ALREADY_REQUESTED');
+    host.ws.send(JSON.stringify({ type: 'request_meeting_summary', adminToken: hostInfo.adminToken }));
+    await duplicateErrorPromise;
+  } finally {
+    global.fetch = originalFetch;
+    await closeSocket(host.ws);
+    await closeSocket(guest.ws);
+  }
 });

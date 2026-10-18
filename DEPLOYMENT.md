@@ -20,6 +20,8 @@ Copy `.env.example` to the deployment provider's environment settings and set:
   `GROQ_API_KEY=your-key`. Never paste it into `webrtc-meeting-client`,
   `config.js`, GitHub, browser code, or chat.
 - `GROQ_TRANSCRIPTION_MODEL=whisper-large-v3-turbo`.
+- `GROQ_SUMMARY_MODEL=openai/gpt-oss-120b` and the bounded summary/transcript
+  limits from `.env.example` when the host-triggered AI summary is enabled.
 - `ICE_SERVERS_JSON` to TURN credentials from a managed TURN provider. Do not
   copy static credentials from the old source file.
 - `JOIN_REQUEST_TTL_MS`, `JOIN_GRANT_TTL_MS`, and `MAX_PENDING_JOIN_REQUESTS`
@@ -32,7 +34,9 @@ Use short-lived TURN credentials and provider-side quotas.
 The Groq fallback endpoint accepts one bounded raw audio chunk per request at
 `POST /captions/transcribe`. It is authenticated with the same short-lived
 server session used by the meeting WebSocket. The browser never receives the
-Groq key.
+Groq key. A host-triggered meeting summary sends only bounded final caption
+text to Groq's chat-completions endpoint once per room; raw audio, private
+notes, and chat history are not included in that summary request.
 
 Room codes only create a join request. The host must admit each visitor before
 that visitor receives a short-lived, one-use admission grant. Admission state
