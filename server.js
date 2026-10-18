@@ -21,9 +21,13 @@ const wss = new WebSocketServer({
 const configuredPort = Number(process.env.PORT);
 const PORT = Number.isInteger(configuredPort) && configuredPort >= 0 ? configuredPort : 8080;
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const REQUIRE_TLS = process.env.REQUIRE_TLS === 'true' || NODE_ENV === 'production';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_TRANSCRIPTION_MODEL = process.env.GROQ_TRANSCRIPTION_MODEL || 'whisper-large-v3-turbo';
+const GROQ_MAX_AUDIO_BYTES = clampNumber(process.env.GROQ_MAX_AUDIO_BYTES, 256 * 1024, 25 * 1024 * 1024, 10 * 1024 * 1024);
 const MAX_PARTICIPANTS = clampNumber(process.env.MAX_PARTICIPANTS, 2, 100, 25);
 const ROOM_IDLE_TIMEOUT_MS = clampNumber(process.env.ROOM_IDLE_TIMEOUT_MS, 60_000, 7 * 24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000);
 const DISCONNECT_GRACE_MS = clampNumber(process.env.DISCONNECT_GRACE_MS, 5_000, 5 * 60 * 1000, 30_000);
@@ -32,6 +36,20 @@ const AUTH_TIMEOUT_MS = 10_000;
 const MAX_CHAT_LENGTH = 1_000;
 const MAX_CAPTION_LENGTH = 500;
 const MAX_TRANSLATION_LENGTH = 1_000;
+const MAX_SIGNALING_SDP_LENGTH = 100_000;
+const MAX_SIGNALING_CANDIDATE_LENGTH = 8_000;
+const MAX_INBOUND_BYTES_PER_WINDOW = 1_500_000;
+const MAX_INVALID_MESSAGES = 5;
+const MAX_OUTBOUND_BUFFERED_BYTES = 512 * 1024;
+const MAX_ACTIVE_CONNECTIONS = clampNumber(process.env.MAX_ACTIVE_CONNECTIONS, 10, 50_000, 2_000);
+const MAX_CONNECTIONS_PER_IP = clampNumber(process.env.MAX_CONNECTIONS_PER_IP, 1, 200, 25);
+const MAX_CONNECTIONS_PER_USER = clampNumber(process.env.MAX_CONNECTIONS_PER_USER, 1, 20, 5);
+const MAX_ACTIVE_ROOMS = clampNumber(process.env.MAX_ACTIVE_ROOMS, 1, 20_000, 2_000);
+const MAX_ROOMS_PER_USER = clampNumber(process.env.MAX_ROOMS_PER_USER, 1, 100, 5);
+const JOIN_REQUEST_TTL_MS = clampNumber(process.env.JOIN_REQUEST_TTL_MS, 15_000, 10 * 60 * 1000, 120_000);
+const JOIN_GRANT_TTL_MS = clampNumber(process.env.JOIN_GRANT_TTL_MS, 10_000, 5 * 60 * 1000, 30_000);
+const MAX_PENDING_JOIN_REQUESTS = clampNumber(process.env.MAX_PENDING_JOIN_REQUESTS, 1, 200, 50);
+const TRUST_PROXY_HOPS = clampNumber(process.env.TRUST_PROXY_HOPS, 0, 10, 0);
 
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:3000',
@@ -73,9 +91,10 @@ const rooms = new Map();
 const connections = new Map();
 const sessions = new Map();
 const translationUsage = new Map();
-const translationMemoryCache = new Map();
-const MAX_TRANSLATION_CACHE_SIZE = 1000;
+const pendingJoinRequests = new Map();
 const connectionAttempts = new Map();
+const activeConnectionsByIp = new Map();
+const authenticatedConnectionsByUser = new Map();
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
 function clampNumber(value, min, max, fallback) {
@@ -89,12 +108,29 @@ function randomToken(bytes = 32) {
 }
 
 function isAllowedOrigin(origin) {
-  // Native WebSocket clients do not send Origin. Browser clients are checked.
+  // Non-browser HTTP clients may omit Origin. Browser WebSocket upgrades use
+  // the stricter check below.
   return !origin || ALLOWED_ORIGINS.has(origin);
 }
 
+function isAllowedWebSocketOrigin(origin) {
+  // A browser must send Origin in production. Native clients are not part of
+  // this browser product and should not get an origin-check bypass.
+  return origin ? ALLOWED_ORIGINS.has(origin) : NODE_ENV !== 'production';
+}
+
+function getClientAddress(request) {
+  if (TRUST_PROXY_HOPS > 0) {
+    const forwarded = request.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0].trim();
+  }
+  return request.socket.remoteAddress || 'unknown';
+}
+
 function canOpenConnection(request) {
-  const address = request.socket.remoteAddress || 'unknown';
+  if (wss.clients.size >= MAX_ACTIVE_CONNECTIONS) return false;
+  const address = getClientAddress(request);
+  if ((activeConnectionsByIp.get(address) || 0) >= MAX_CONNECTIONS_PER_IP) return false;
   const now = Date.now();
   const record = connectionAttempts.get(address) || { startedAt: now, count: 0 };
   if (now - record.startedAt >= 60_000) {
@@ -104,6 +140,37 @@ function canOpenConnection(request) {
   record.count += 1;
   connectionAttempts.set(address, record);
   return record.count <= 30;
+}
+
+function incrementCount(map, key) {
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+function decrementCount(map, key) {
+  const next = (map.get(key) || 0) - 1;
+  if (next > 0) map.set(key, next);
+  else map.delete(key);
+}
+
+function countRoomsCreatedBy(userId) {
+  let count = 0;
+  for (const room of rooms.values()) {
+    if (room.createdByUserId === userId) count += 1;
+  }
+  return count;
+}
+
+function registerAuthenticatedConnection(state, userId) {
+  if ((authenticatedConnectionsByUser.get(userId) || 0) >= MAX_CONNECTIONS_PER_USER) return false;
+  state.authenticatedUserId = userId;
+  incrementCount(authenticatedConnectionsByUser, userId);
+  return true;
+}
+
+function unregisterAuthenticatedConnection(state) {
+  if (!state.authenticatedUserId) return;
+  decrementCount(authenticatedConnectionsByUser, state.authenticatedUserId);
+  state.authenticatedUserId = null;
 }
 
 function parseIceServers() {
@@ -121,9 +188,10 @@ function parseIceServers() {
 }
 
 const iceServers = parseIceServers();
+const publicIceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 app.disable('x-powered-by');
-app.set('trust proxy', 1);
+app.set('trust proxy', TRUST_PROXY_HOPS);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({
   origin(origin, callback) {
@@ -131,10 +199,21 @@ app.use(cors({
     return callback(new Error('Origin is not allowed'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Caption-Language',
+    'X-Caption-Chunk'
+  ],
   maxAge: 86400
 }));
 app.use(express.json({ limit: '32kb' }));
+app.use((req, res, next) => {
+  if (!REQUIRE_TLS || req.path === '/health') return next();
+  const forwardedProtocol = String(req.get('x-forwarded-proto') || '').split(',')[0].trim().toLowerCase();
+  if (req.secure || forwardedProtocol === 'https' || req.socket.encrypted) return next();
+  return sendJsonError(res, 426, 'HTTPS is required');
+});
 
 const generalHttpLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -152,7 +231,17 @@ const translationLimiter = rateLimit({
   message: { error: 'Translation rate limit exceeded.' }
 });
 
+const transcriptionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator: req => req.meetingSession.user.sub,
+  message: { error: 'Caption transcription rate limit exceeded.' }
+});
+
 app.use(['/ice', '/translate'], generalHttpLimiter);
+app.use('/captions/transcribe', generalHttpLimiter);
 
 function getSessionFromRequest(req) {
   const header = req.get('authorization') || '';
@@ -165,12 +254,29 @@ function getSessionFromRequest(req) {
     return null;
   }
 
-  session.expiresAt = Date.now() + SESSION_TTL_MS;
+  const connection = connections.get(session.clientId);
+  if (
+    !connection ||
+    !connection.authenticated ||
+    connection.sessionToken !== match[1] ||
+    connection.user?.sub !== session.user.sub
+  ) {
+    sessions.delete(match[1]);
+    return null;
+  }
+
   return session;
 }
 
 function sendJsonError(res, status, message) {
   return res.status(status).json({ error: message });
+}
+
+function requireSession(req, res, next) {
+  const session = getSessionFromRequest(req);
+  if (!session) return sendJsonError(res, 401, 'Authentication required');
+  req.meetingSession = session;
+  return next();
 }
 
 app.get('/health', (req, res) => {
@@ -189,10 +295,13 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/ice', (req, res) => {
+  const session = getSessionFromRequest(req);
   res.set('Cache-Control', 'no-store');
   res.json({
-    iceServers,
-    iceTransportPolicy: process.env.ICE_TRANSPORT_POLICY === 'relay' ? 'relay' : 'all',
+    // Never expose configured TURN credentials to unauthenticated callers.
+    // Use short-lived TURN credentials in ICE_SERVERS_JSON in production.
+    iceServers: session ? iceServers : publicIceServers,
+    iceTransportPolicy: session && process.env.ICE_TRANSPORT_POLICY === 'relay' ? 'relay' : 'all',
     iceCandidatePoolSize: 10
   });
 });
@@ -200,6 +309,7 @@ app.get('/ice', (req, res) => {
 app.post('/translate', translationLimiter, async (req, res) => {
   const session = getSessionFromRequest(req);
   if (!session) return sendJsonError(res, 401, 'Authentication required');
+  res.set('Cache-Control', 'no-store');
 
   if (!GEMINI_API_KEY) {
     return sendJsonError(res, 503, 'Translation service is not configured');
@@ -219,11 +329,6 @@ app.post('/translate', translationLimiter, async (req, res) => {
   const trimmedText = text.trim();
   if (sourceLang === targetLang) {
     return res.json({ translatedText: trimmedText });
-  }
-
-  const cacheKey = `${sourceLang}->${targetLang}:${trimmedText.toLowerCase()}`;
-  if (translationMemoryCache.has(cacheKey)) {
-    return res.json({ translatedText: translationMemoryCache.get(cacheKey) });
   }
 
   const usage = translationUsage.get(session.user.sub) || { windowStartedAt: Date.now(), count: 0 };
@@ -275,12 +380,6 @@ app.post('/translate', translationLimiter, async (req, res) => {
     const translatedText = payload?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
     if (!translatedText) return sendJsonError(res, 502, 'Translation provider returned no text');
 
-    if (translationMemoryCache.size >= MAX_TRANSLATION_CACHE_SIZE) {
-      const oldestKey = translationMemoryCache.keys().next().value;
-      translationMemoryCache.delete(oldestKey);
-    }
-    translationMemoryCache.set(cacheKey, translatedText);
-
     return res.json({ translatedText });
   } catch (error) {
     console.error('Translation request failed:', error.name === 'AbortError' ? 'timeout' : error.message);
@@ -290,10 +389,109 @@ app.post('/translate', translationLimiter, async (req, res) => {
   }
 });
 
+function getWhisperLanguage(language) {
+  if (typeof language !== 'string') return null;
+  const normalized = language.trim().toLowerCase();
+  return /^[a-z]{2}$/.test(normalized) ? normalized : normalized.split('-')[0].match(/^[a-z]{2}$/)?.[0] || null;
+}
+
+const ALLOWED_AUDIO_TYPES = new Set([
+  'audio/webm',
+  'audio/ogg',
+  'audio/mp4',
+  'audio/mpeg',
+  'audio/wav',
+  'audio/x-wav'
+]);
+
+app.post(
+  '/captions/transcribe',
+  requireSession,
+  transcriptionLimiter,
+  express.raw({ type: () => true, limit: GROQ_MAX_AUDIO_BYTES }),
+  async (req, res) => {
+  const session = req.meetingSession;
+  res.set('Cache-Control', 'no-store');
+
+  const connection = connections.get(session.clientId);
+  const room = connection ? getCurrentRoom(connection) : null;
+  if (!connection || !room || !connection.authenticated) {
+    return sendJsonError(res, 403, 'You must be in a meeting to transcribe audio');
+  }
+  if (!GROQ_API_KEY) return sendJsonError(res, 503, 'Groq transcription is not configured');
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+    return sendJsonError(res, 400, 'An audio file is required');
+  }
+  const audioMimeType = String(req.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!ALLOWED_AUDIO_TYPES.has(audioMimeType)) {
+    return sendJsonError(res, 415, 'Unsupported audio format');
+  }
+
+  const form = new FormData();
+  form.append('file', new Blob([req.body], { type: audioMimeType }), `caption-${Date.now()}.${audioMimeType.split('/')[1] || 'webm'}`);
+  form.append('model', GROQ_TRANSCRIPTION_MODEL);
+  form.append('temperature', '0');
+  form.append('response_format', 'verbose_json');
+  const whisperLanguage = getWhisperLanguage(req.get('x-caption-language'));
+  if (whisperLanguage) form.append('language', whisperLanguage);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const providerResponse = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+      body: form,
+      signal: controller.signal
+    });
+    const payload = await providerResponse.json().catch(() => null);
+    if (!providerResponse.ok) {
+      console.error('Groq transcription provider rejected request:', providerResponse.status);
+      return sendJsonError(res, 502, 'Caption transcription provider unavailable');
+    }
+
+    const text = typeof payload?.text === 'string' ? payload.text.trim().slice(0, MAX_CAPTION_LENGTH) : '';
+    if (!text) return res.json({ text: '', provider: 'groq' });
+
+    broadcast(room, {
+      type: 'caption',
+      fromClientId: connection.clientId,
+      fromUsername: connection.user.name,
+      text,
+      isFinal: true,
+      language: CAPTION_LANGUAGES[req.get('x-caption-language')] ? req.get('x-caption-language') : 'en-US',
+      provider: 'groq',
+      chunkNumber: Number(req.get('x-caption-chunk')) || 0
+    }, connection.clientId);
+
+    return res.json({ text, provider: 'groq' });
+  } catch (error) {
+    console.error('Groq transcription request failed:', error.name === 'AbortError' ? 'timeout' : error.message);
+    return sendJsonError(res, 502, 'Caption transcription provider unavailable');
+  } finally {
+    clearTimeout(timeout);
+  }
+  }
+);
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error?.type === 'entity.too.large') return sendJsonError(res, 413, 'Audio chunk is too large');
+  if (error?.message === 'Origin is not allowed') return sendJsonError(res, 403, 'Origin is not allowed');
+  console.error('HTTP request failed:', error?.message || error);
+  return sendJsonError(res, 500, 'Request could not be processed');
+});
+
 function safeSend(ws, message) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   try {
-    ws.send(JSON.stringify(message));
+    const serialized = JSON.stringify(message);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_OUTBOUND_BUFFERED_BYTES) return false;
+    if (ws.bufferedAmount > MAX_OUTBOUND_BUFFERED_BYTES) {
+      ws.close(1009, 'Connection is too slow');
+      return false;
+    }
+    ws.send(serialized);
     return true;
   } catch (error) {
     console.error('WebSocket send failed:', error.message);
@@ -362,6 +560,159 @@ function sendYourInfo(state, room = null) {
   });
 }
 
+function countActiveJoinGrants(room) {
+  let count = 0;
+  for (const request of pendingJoinRequests.values()) {
+    if (request.roomId === room.roomId && request.status === 'granted') count += 1;
+  }
+  return count;
+}
+
+function sendPendingJoinRequests(room, targetState = null) {
+  const host = targetState || connections.get(room?.adminClientId);
+  if (!room || !host || !host.ws || host.clientId !== room.adminClientId) return;
+  safeSend(host.ws, {
+    type: 'pending_join_requests',
+    roomId: room.roomId,
+    requests: Array.from(room.pendingJoinRequests.values()).map(request => ({
+      requestId: request.requestId,
+      roomId: request.roomId,
+      username: request.username,
+      picture: request.picture,
+      expiresAt: request.expiresAt
+    }))
+  });
+}
+
+function clearJoinRequestTimer(request) {
+  if (request?.expiryTimer) {
+    clearTimeout(request.expiryTimer);
+    request.expiryTimer = null;
+  }
+}
+
+function notifyJoinRequestRemoved(request, reason) {
+  const room = rooms.get(request.roomId);
+  const host = room ? connections.get(room.adminClientId) : null;
+  if (host && host.clientId === room.adminClientId) {
+    safeSend(host.ws, {
+      type: 'join_request_removed',
+      requestId: request.requestId,
+      roomId: request.roomId,
+      reason
+    });
+  }
+}
+
+function removeJoinRequestFromQueue(request, reason) {
+  const room = rooms.get(request.roomId);
+  if (room?.pendingJoinRequests?.delete(request.requestId)) {
+    notifyJoinRequestRemoved(request, reason);
+  }
+}
+
+function destroyJoinRequest(request, reason, requesterMessageType = null) {
+  if (!request || !pendingJoinRequests.has(request.requestId)) return;
+  clearJoinRequestTimer(request);
+  removeJoinRequestFromQueue(request, reason);
+  pendingJoinRequests.delete(request.requestId);
+
+  const requester = connections.get(request.requesterClientId);
+  if (requester?.pendingJoinRequestId === request.requestId) requester.pendingJoinRequestId = null;
+  if (requesterMessageType && requester) {
+    safeSend(requester.ws, {
+      type: requesterMessageType,
+      requestId: request.requestId,
+      roomId: request.roomId,
+      reason
+    });
+  }
+}
+
+function expireJoinRequest(request) {
+  if (!request || !pendingJoinRequests.has(request.requestId)) return;
+  destroyJoinRequest(request, request.status === 'granted' ? 'ADMISSION_TIMEOUT' : 'REQUEST_TIMEOUT', 'join_request_expired');
+}
+
+function scheduleJoinRequestExpiry(request, delay) {
+  clearJoinRequestTimer(request);
+  request.expiryTimer = setTimeout(() => expireJoinRequest(request), delay);
+  request.expiryTimer.unref?.();
+}
+
+function cancelJoinRequestForState(state, reason = 'REQUEST_CANCELLED') {
+  const request = state?.pendingJoinRequestId ? pendingJoinRequests.get(state.pendingJoinRequestId) : null;
+  if (!request || request.requesterClientId !== state.clientId) {
+    if (state) state.pendingJoinRequestId = null;
+    return;
+  }
+  destroyJoinRequest(request, reason, state.ws.readyState === WebSocket.OPEN ? 'join_request_cancelled' : null);
+}
+
+function validateAdmissionToken(state, room, token) {
+  const request = token
+    ? Array.from(pendingJoinRequests.values()).find(candidate => candidate.admissionToken === token)
+    : null;
+  if (
+    !request ||
+    request.status !== 'granted' ||
+    request.roomId !== room.roomId ||
+    request.requesterClientId !== state.clientId ||
+    request.requesterUserId !== state.user.sub ||
+    request.grantExpiresAt <= Date.now()
+  ) return null;
+  return request;
+}
+
+function admitJoinRequest(state, requestId, providedAdminToken) {
+  const room = getCurrentRoom(state);
+  if (!room || room.adminClientId !== state.clientId || providedAdminToken !== room.adminToken) {
+    safeSend(state.ws, { type: 'error', code: 'UNAUTHORIZED', message: 'Only the host can admit participants.' });
+    return;
+  }
+  const request = room.pendingJoinRequests.get(requestId);
+  if (!request || request.status !== 'pending') {
+    safeSend(state.ws, { type: 'error', code: 'REQUEST_NOT_FOUND', message: 'That join request is no longer available.' });
+    return;
+  }
+  if (room.participants.size + countActiveJoinGrants(room) >= MAX_PARTICIPANTS) {
+    return safeSend(state.ws, { type: 'error', code: 'ROOM_FULL', message: 'There is no available participant slot.' });
+  }
+
+  request.status = 'granted';
+  request.admissionToken = randomToken();
+  request.grantExpiresAt = Date.now() + JOIN_GRANT_TTL_MS;
+  removeJoinRequestFromQueue(request, 'ADMITTED');
+  scheduleJoinRequestExpiry(request, JOIN_GRANT_TTL_MS);
+
+  const requester = connections.get(request.requesterClientId);
+  if (!requester || requester.user?.sub !== request.requesterUserId || requester.roomId || requester.ws.readyState !== WebSocket.OPEN) {
+    return destroyJoinRequest(request, 'REQUESTER_UNAVAILABLE');
+  }
+  requester.pendingJoinRequestId = request.requestId;
+  safeSend(requester.ws, {
+    type: 'join_admitted',
+    requestId: request.requestId,
+    roomId: request.roomId,
+    admissionToken: request.admissionToken,
+    expiresAt: request.grantExpiresAt
+  });
+}
+
+function rejectJoinRequest(state, requestId, providedAdminToken) {
+  const room = getCurrentRoom(state);
+  if (!room || room.adminClientId !== state.clientId || providedAdminToken !== room.adminToken) {
+    safeSend(state.ws, { type: 'error', code: 'UNAUTHORIZED', message: 'Only the host can reject participants.' });
+    return;
+  }
+  const request = room.pendingJoinRequests.get(requestId);
+  if (!request || request.status !== 'pending') {
+    safeSend(state.ws, { type: 'error', code: 'REQUEST_NOT_FOUND', message: 'That join request is no longer available.' });
+    return;
+  }
+  destroyJoinRequest(request, 'HOST_REJECTED', 'join_rejected');
+}
+
 function requireAuthenticated(state) {
   if (!state.authenticated || !state.user) {
     safeSend(state.ws, { type: 'error', code: 'AUTH_REQUIRED', message: 'Please sign in before using the meeting.' });
@@ -401,6 +752,54 @@ function validateMessage(data) {
   return null;
 }
 
+function isSafeClientId(value) {
+  return typeof value === 'string' && /^[a-f0-9-]{36}$/i.test(value);
+}
+
+function isValidSdpDescription(value, expectedType) {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    value.type === expectedType &&
+    typeof value.sdp === 'string' &&
+    value.sdp.length > 0 &&
+    value.sdp.length <= MAX_SIGNALING_SDP_LENGTH
+  );
+}
+
+function isValidIceCandidate(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (typeof value.candidate !== 'string' || value.candidate.length > MAX_SIGNALING_CANDIDATE_LENGTH) return false;
+  if (value.sdpMid !== null && value.sdpMid !== undefined && (typeof value.sdpMid !== 'string' || value.sdpMid.length > 100)) return false;
+  if (value.sdpMLineIndex !== null && value.sdpMLineIndex !== undefined && (!Number.isInteger(value.sdpMLineIndex) || value.sdpMLineIndex < 0 || value.sdpMLineIndex > 100)) return false;
+  if (value.usernameFragment !== null && value.usernameFragment !== undefined && (typeof value.usernameFragment !== 'string' || value.usernameFragment.length > 256)) return false;
+  return true;
+}
+
+function recordInboundFrame(state, byteLength) {
+  const now = Date.now();
+  if (now - state.bytesWindowStartedAt >= 10_000) {
+    state.bytesWindowStartedAt = now;
+    state.bytesReceived = 0;
+  }
+  state.bytesReceived += byteLength;
+  if (state.bytesReceived > MAX_INBOUND_BYTES_PER_WINDOW) {
+    state.ws.close(1008, 'Message rate exceeded');
+    return false;
+  }
+  return true;
+}
+
+function recordInvalidMessage(state) {
+  state.invalidMessages += 1;
+  if (state.invalidMessages >= MAX_INVALID_MESSAGES) {
+    state.ws.close(1008, 'Too many invalid messages');
+    return false;
+  }
+  return true;
+}
+
 function rateLimitMessage(state, type) {
   const now = Date.now();
   state.messageTimes = state.messageTimes.filter(timestamp => now - timestamp < 10_000);
@@ -425,13 +824,16 @@ async function verifyGoogleCredential(credential) {
     sub: payload.sub,
     email: payload.email,
     name: String(payload.name || payload.email.split('@')[0]).slice(0, 80),
-    picture: typeof payload.picture === 'string' ? payload.picture.slice(0, 2_000) : null
+    picture: typeof payload.picture === 'string' && /^https:\/\//i.test(payload.picture)
+      ? payload.picture.slice(0, 2_000)
+      : null
   };
 }
 
 function createSession(user, clientId) {
   const token = randomToken(32);
-  sessions.set(token, { user, clientId, expiresAt: Date.now() + SESSION_TTL_MS });
+  const issuedAt = Date.now();
+  sessions.set(token, { user, clientId, issuedAt, expiresAt: issuedAt + SESSION_TTL_MS });
   return token;
 }
 
@@ -462,6 +864,7 @@ function promoteReplacementAdmin(room) {
     newAdminId: replacement.clientId,
     newAdminName: replacement.user.name
   });
+  sendPendingJoinRequests(room, replacement);
 }
 
 function removeParticipant(room, participant, notify = true) {
@@ -474,7 +877,12 @@ function removeParticipant(room, participant, notify = true) {
     promoteReplacementAdmin(room);
   }
 
-  if (room.participants.size === 0) rooms.delete(room.roomId);
+  if (room.participants.size === 0) {
+    for (const request of Array.from(pendingJoinRequests.values())) {
+      if (request.roomId === room.roomId) destroyJoinRequest(request, 'MEETING_ENDED', 'join_request_expired');
+    }
+    rooms.delete(room.roomId);
+  }
 }
 
 function markDisconnected(state) {
@@ -497,8 +905,12 @@ function markDisconnected(state) {
 
 function closeRoom(room, reason) {
   if (!room) return;
+  for (const request of Array.from(pendingJoinRequests.values())) {
+    if (request.roomId === room.roomId) destroyJoinRequest(request, 'MEETING_ENDED', 'join_request_expired');
+  }
   broadcast(room, { type: 'meeting_ended', reason });
   for (const participant of room.participants.values()) {
+    if (participant.disconnectTimer) clearTimeout(participant.disconnectTimer);
     if (participant.ws && participant.ws.readyState === WebSocket.OPEN) {
       participant.ws.close(1000, reason || 'Meeting ended');
     }
@@ -520,14 +932,20 @@ async function handleMessage(state, data) {
       if (!credential) return safeSend(state.ws, { type: 'error', code: 'INVALID_CREDENTIAL', message: 'A valid Google credential is required.' });
       try {
         const user = await verifyGoogleCredential(credential);
+        if (!registerAuthenticatedConnection(state, user.sub)) {
+          safeSend(state.ws, { type: 'error', code: 'SESSION_LIMIT', message: 'Too many active sessions for this account.' });
+          return state.ws.close(1008, 'Session limit reached');
+        }
         state.user = user;
         state.authenticated = true;
         state.sessionToken = createSession(user, state.clientId);
         safeSend(state.ws, { type: 'authenticated', sessionToken: state.sessionToken, user });
         sendYourInfo(state, getCurrentRoom(state));
       } catch (error) {
+        state.authFailures += 1;
         console.error('Google authentication failed:', error.message);
         safeSend(state.ws, { type: 'error', code: 'AUTH_FAILED', message: 'Google sign-in could not be verified.' });
+        if (state.authFailures >= 3) state.ws.close(1008, 'Authentication failed');
       }
       return;
     }
@@ -535,18 +953,59 @@ async function handleMessage(state, data) {
     case 'ping':
       return safeSend(state.ws, { type: 'pong', timestamp: Date.now() });
 
+    case 'logout':
+      cancelJoinRequestForState(state);
+      {
+        const room = getCurrentRoom(state);
+        if (room) removeParticipant(room, room.participants.get(state.clientId));
+        state.roomId = null;
+      }
+      if (state.sessionToken) sessions.delete(state.sessionToken);
+      state.sessionToken = null;
+      unregisterAuthenticatedConnection(state);
+      state.authenticated = false;
+      state.user = null;
+      state.ws.close(1000, 'Signed out');
+      return;
+
+    case 'prepare_room': {
+      if (!requireAuthenticated(state) || state.roomId) return;
+      if (data.action === 'create') {
+        if (rooms.size >= MAX_ACTIVE_ROOMS) return safeSend(state.ws, { type: 'error', code: 'SERVICE_BUSY', message: 'The meeting service is at capacity.' });
+        if (countRoomsCreatedBy(state.user.sub) >= MAX_ROOMS_PER_USER) {
+          return safeSend(state.ws, { type: 'error', code: 'ROOM_QUOTA', message: 'You have reached the active meeting limit.' });
+        }
+        return safeSend(state.ws, { type: 'room_prepared', action: 'create' });
+      }
+
+      if (data.action === 'join') {
+        const roomId = validateRoomId(data.roomId);
+        const room = roomId ? rooms.get(roomId) : null;
+        if (!room) return safeSend(state.ws, { type: 'error', code: 'ROOM_NOT_FOUND', message: 'Meeting not found or already ended.' });
+        if (room.participants.size + countActiveJoinGrants(room) >= MAX_PARTICIPANTS) return safeSend(state.ws, { type: 'error', code: 'ROOM_FULL', message: 'This meeting is full.' });
+        return safeSend(state.ws, { type: 'room_prepared', action: 'join', roomId, admissionRequired: true });
+      }
+
+      return safeSend(state.ws, { type: 'error', code: 'INVALID_PREPARATION', message: 'Invalid meeting action.' });
+    }
+
     case 'create_room': {
       if (!requireAuthenticated(state) || state.roomId) return;
-      if (rooms.size >= 10_000) return safeSend(state.ws, { type: 'error', message: 'The meeting service is at capacity.' });
+      if (rooms.size >= MAX_ACTIVE_ROOMS) return safeSend(state.ws, { type: 'error', code: 'SERVICE_BUSY', message: 'The meeting service is at capacity.' });
+      if (countRoomsCreatedBy(state.user.sub) >= MAX_ROOMS_PER_USER) {
+        return safeSend(state.ws, { type: 'error', code: 'ROOM_QUOTA', message: 'You have reached the active meeting limit.' });
+      }
 
       const roomId = generateRoomId();
       const participant = createParticipant(state, roomId);
       const room = {
         roomId,
+        createdByUserId: state.user.sub,
         adminClientId: state.clientId,
         adminUserId: state.user.sub,
         adminToken: randomToken(),
         participants: new Map([[state.clientId, participant]]),
+        pendingJoinRequests: new Map(),
         createdAt: Date.now(),
         lastActivityAt: Date.now()
       };
@@ -558,13 +1017,97 @@ async function handleMessage(state, data) {
       return;
     }
 
+    case 'request_join': {
+      if (!requireAuthenticated(state) || state.roomId) return;
+      const roomId = validateRoomId(data.roomId);
+      const room = roomId ? rooms.get(roomId) : null;
+      if (!room) return safeSend(state.ws, { type: 'error', code: 'ROOM_NOT_FOUND', message: 'Meeting not found or already ended.' });
+      if (state.pendingJoinRequestId) {
+        const existing = pendingJoinRequests.get(state.pendingJoinRequestId);
+        if (existing && existing.roomId === roomId) {
+          return safeSend(state.ws, {
+            type: 'join_request_pending',
+            requestId: existing.requestId,
+            roomId: existing.roomId,
+            expiresAt: existing.expiresAt
+          });
+        }
+        cancelJoinRequestForState(state);
+      }
+      if (room.participants.size + countActiveJoinGrants(room) >= MAX_PARTICIPANTS) {
+        return safeSend(state.ws, { type: 'error', code: 'ROOM_FULL', message: 'This meeting is full.' });
+      }
+      if (room.pendingJoinRequests.size >= MAX_PENDING_JOIN_REQUESTS) {
+        return safeSend(state.ws, { type: 'ADMISSION_BUSY', message: 'The host admission queue is full. Please try again shortly.' });
+      }
+
+      const now = Date.now();
+      const request = {
+        requestId: randomToken(18),
+        roomId,
+        requesterClientId: state.clientId,
+        requesterUserId: state.user.sub,
+        username: state.user.name,
+        picture: state.user.picture || null,
+        status: 'pending',
+        createdAt: now,
+        expiresAt: now + JOIN_REQUEST_TTL_MS,
+        admissionToken: null,
+        grantExpiresAt: null,
+        expiryTimer: null
+      };
+      pendingJoinRequests.set(request.requestId, request);
+      room.pendingJoinRequests.set(request.requestId, request);
+      state.pendingJoinRequestId = request.requestId;
+      scheduleJoinRequestExpiry(request, JOIN_REQUEST_TTL_MS);
+
+      safeSend(state.ws, {
+        type: 'join_request_pending',
+        requestId: request.requestId,
+        roomId,
+        expiresAt: request.expiresAt
+      });
+      const host = connections.get(room.adminClientId);
+      if (host) safeSend(host.ws, {
+        type: 'join_request_received',
+        requestId: request.requestId,
+        roomId,
+        username: request.username,
+        picture: request.picture,
+        expiresAt: request.expiresAt
+      });
+      return;
+    }
+
+    case 'admit_join_request':
+      if (!requireAuthenticated(state)) return;
+      admitJoinRequest(state, stringValue(data.requestId, 200), stringValue(data.adminToken, 200));
+      return;
+
+    case 'reject_join_request':
+      if (!requireAuthenticated(state)) return;
+      rejectJoinRequest(state, stringValue(data.requestId, 200), stringValue(data.adminToken, 200));
+      return;
+
+    case 'cancel_join_request':
+      if (!requireAuthenticated(state)) return;
+      if (!state.pendingJoinRequestId || state.pendingJoinRequestId !== stringValue(data.requestId, 200)) {
+        return safeSend(state.ws, { type: 'error', code: 'REQUEST_NOT_FOUND', message: 'That join request is no longer available.' });
+      }
+      cancelJoinRequestForState(state);
+      return;
+
     case 'join_room': {
       if (!requireAuthenticated(state) || state.roomId) return;
       const roomId = validateRoomId(data.roomId);
       if (!roomId) return safeSend(state.ws, { type: 'error', code: 'INVALID_ROOM', message: 'Enter a valid six-character meeting code.' });
       const room = rooms.get(roomId);
       if (!room) return safeSend(state.ws, { type: 'error', code: 'ROOM_NOT_FOUND', message: 'Meeting not found or already ended.' });
+      const admissionToken = stringValue(data.admissionToken, 200);
+      const request = validateAdmissionToken(state, room, admissionToken);
+      if (!request) return safeSend(state.ws, { type: 'error', code: 'ADMISSION_REQUIRED', message: 'Host approval is required to join this meeting.' });
       if (room.participants.size >= MAX_PARTICIPANTS) return safeSend(state.ws, { type: 'error', code: 'ROOM_FULL', message: 'This meeting is full.' });
+      destroyJoinRequest(request, 'ADMITTED', null);
 
       const participant = createParticipant(state, roomId);
       room.participants.set(state.clientId, participant);
@@ -590,11 +1133,20 @@ async function handleMessage(state, data) {
       );
       if (!participant) return safeSend(state.ws, { type: 'error', code: 'RESUME_FAILED', message: 'Your meeting session could not be resumed.' });
 
+      const session = sessions.get(state.sessionToken);
+      if (!session) {
+        return safeSend(state.ws, {
+          type: 'error',
+          code: 'RESUME_FAILED',
+          message: 'Your meeting session could not be resumed.'
+        });
+      }
       if (participant.ws && participant.ws !== state.ws) participant.ws.close(1000, 'Session resumed elsewhere');
       if (participant.disconnectTimer) clearTimeout(participant.disconnectTimer);
       connections.delete(state.clientId);
       state.clientId = participant.clientId;
       connections.set(state.clientId, state);
+      session.clientId = state.clientId;
       participant.ws = state.ws;
       participant.lastSeenAt = Date.now();
       state.roomId = room.roomId;
@@ -603,6 +1155,7 @@ async function handleMessage(state, data) {
       safeSend(state.ws, { type: 'room_resumed', roomId: room.roomId, adminClientId: room.adminClientId, resumeToken: participant.resumeToken });
       safeSend(state.ws, { type: 'room_state', adminClientId: room.adminClientId, participants: getRoomState(room, state.clientId) });
       sendYourInfo(state, room);
+      if (room.adminClientId === state.clientId) sendPendingJoinRequests(room, state);
       broadcast(room, { type: 'peer_reconnected', ...participantState(participant) }, state.clientId);
       return;
     }
@@ -622,9 +1175,13 @@ async function handleMessage(state, data) {
     case 'ice_candidate': {
       const room = requireRoom(state);
       const targetId = stringValue(data.targetClientId || data.target, 100);
-      if (!room || !targetId) return;
+      if (!room || !targetId || !isSafeClientId(targetId)) return;
       const target = room.participants.get(targetId);
       if (!target || !target.ws) return;
+
+      if (data.type === 'offer' && !isValidSdpDescription(data.sdp, 'offer')) return;
+      if (data.type === 'answer' && !isValidSdpDescription(data.sdp, 'answer')) return;
+      if (data.type === 'ice_candidate' && !isValidIceCandidate(data.candidate)) return;
 
       const payload = {
         type: data.type,
@@ -632,8 +1189,16 @@ async function handleMessage(state, data) {
         fromId: state.clientId,
         fromUsername: state.user.name
       };
-      if (data.type === 'ice_candidate') payload.candidate = data.candidate;
-      else payload.sdp = data.sdp;
+      if (data.type === 'ice_candidate') {
+        payload.candidate = {
+          candidate: data.candidate.candidate,
+          sdpMid: data.candidate.sdpMid ?? null,
+          sdpMLineIndex: data.candidate.sdpMLineIndex ?? null,
+          usernameFragment: data.candidate.usernameFragment ?? null
+        };
+      } else {
+        payload.sdp = { type: data.sdp.type, sdp: data.sdp.sdp };
+      }
       safeSend(target.ws, payload);
       return;
     }
@@ -679,6 +1244,30 @@ async function handleMessage(state, data) {
       return;
     }
 
+    case 'recording_state': {
+      const room = requireRoom(state);
+      if (!room || typeof data.active !== 'boolean') return;
+      broadcast(room, {
+        type: 'recording_state',
+        clientId: state.clientId,
+        username: state.user.name,
+        active: data.active
+      });
+      return;
+    }
+
+    case 'screen_share_state': {
+      const room = requireRoom(state);
+      if (!room || typeof data.active !== 'boolean') return;
+      broadcast(room, {
+        type: 'screen_share_state',
+        clientId: state.clientId,
+        username: state.user.name,
+        active: data.active
+      }, state.clientId);
+      return;
+    }
+
     case 'raise_hand': {
       const room = requireRoom(state);
       const participant = room?.participants.get(state.clientId);
@@ -712,7 +1301,7 @@ async function handleMessage(state, data) {
         return safeSend(state.ws, { type: 'error', code: 'UNAUTHORIZED', message: 'Only the host can perform that action.' });
       }
 
-      if (data.action === 'mute_toggle' && typeof data.targetClientId === 'string') {
+      if (data.action === 'mute_toggle' && isSafeClientId(data.targetClientId)) {
         const target = room.participants.get(data.targetClientId);
         if (!target || target.clientId === state.clientId) return;
         target.isMuted = Boolean(data.muteState);
@@ -738,7 +1327,7 @@ async function handleMessage(state, data) {
           });
         }
         broadcast(room, { type: 'all_hands_lowered' });
-      } else if (data.action === 'transfer_admin' && typeof data.targetClientId === 'string') {
+      } else if (data.action === 'transfer_admin' && isSafeClientId(data.targetClientId)) {
         const target = room.participants.get(data.targetClientId);
         if (!target || !target.ws || target.clientId === state.clientId) return;
         const oldAdminId = room.adminClientId;
@@ -776,14 +1365,22 @@ wss.on('connection', (ws, request) => {
   const state = {
     clientId: crypto.randomUUID(),
     ws,
+    ipAddress: getClientAddress(request),
     user: null,
     authenticated: false,
+    authenticatedUserId: null,
     sessionToken: null,
     roomId: null,
+    pendingJoinRequestId: null,
     messageTimes: [],
-    authTimer: null
+    authTimer: null,
+    invalidMessages: 0,
+    bytesWindowStartedAt: Date.now(),
+    bytesReceived: 0,
+    authFailures: 0
   };
   connections.set(state.clientId, state);
+  incrementCount(activeConnectionsByIp, state.ipAddress);
   ws.isAlive = true;
 
   state.authTimer = setTimeout(() => {
@@ -799,11 +1396,17 @@ wss.on('connection', (ws, request) => {
   });
 
   ws.on('message', async raw => {
+    if (!recordInboundFrame(state, Buffer.byteLength(raw))) return;
     let data;
     try {
       data = JSON.parse(raw.toString());
     } catch (error) {
-      return safeSend(ws, { type: 'error', code: 'INVALID_JSON', message: 'Message must be valid JSON.' });
+      if (recordInvalidMessage(state)) safeSend(ws, { type: 'error', code: 'INVALID_JSON', message: 'Message must be valid JSON.' });
+      return;
+    }
+    if (validateMessage(data)) {
+      if (recordInvalidMessage(state)) safeSend(ws, { type: 'error', code: 'INVALID_MESSAGE', message: 'Invalid message format.' });
+      return;
     }
     try {
       await handleMessage(state, data);
@@ -815,9 +1418,13 @@ wss.on('connection', (ws, request) => {
 
   ws.on('close', () => {
     if (state.authTimer) clearTimeout(state.authTimer);
-    if (connections.get(state.clientId) !== state) return;
-    connections.delete(state.clientId);
-    markDisconnected(state);
+    cancelJoinRequestForState(state, 'REQUESTER_DISCONNECTED');
+    const isCurrentConnection = connections.get(state.clientId) === state;
+    if (isCurrentConnection) connections.delete(state.clientId);
+    decrementCount(activeConnectionsByIp, state.ipAddress);
+    unregisterAuthenticatedConnection(state);
+    if (state.sessionToken) sessions.delete(state.sessionToken);
+    if (isCurrentConnection) markDisconnected(state);
   });
 
   ws.on('error', error => {
@@ -827,7 +1434,9 @@ wss.on('connection', (ws, request) => {
 
 server.on('upgrade', (request, socket, head) => {
   const pathname = new URL(request.url || '/', 'http://localhost').pathname;
-  if (!['/', '/ws'].includes(pathname) || !isAllowedOrigin(request.headers.origin) || !canOpenConnection(request)) {
+  const forwardedProtocol = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const secureUpgrade = !REQUIRE_TLS || forwardedProtocol === 'https' || request.socket.encrypted;
+  if (!['/', '/ws'].includes(pathname) || !isAllowedWebSocketOrigin(request.headers.origin) || !secureUpgrade || !canOpenConnection(request)) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     socket.destroy();
     return;
@@ -858,6 +1467,10 @@ const cleanupInterval = setInterval(() => {
   }
   for (const [token, session] of sessions) {
     if (session.expiresAt <= now) sessions.delete(token);
+  }
+  for (const request of pendingJoinRequests.values()) {
+    if (request.status === 'pending' && request.expiresAt <= now) expireJoinRequest(request);
+    if (request.status === 'granted' && request.grantExpiresAt <= now) expireJoinRequest(request);
   }
   for (const [userId, usage] of translationUsage) {
     if (now - usage.windowStartedAt > 60_000) translationUsage.delete(userId);

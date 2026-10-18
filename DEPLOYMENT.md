@@ -11,13 +11,39 @@ Copy `.env.example` to the deployment provider's environment settings and set:
 
 - `GOOGLE_CLIENT_ID` to the same client ID used by the browser configuration.
 - `ALLOWED_ORIGINS` to the exact HTTPS origin hosting the client.
+- `NODE_ENV=production`, `REQUIRE_TLS=true`, and `TRUST_PROXY_HOPS=1` when
+  exactly one trusted HTTPS reverse proxy sits in front of Node. Keep
+  `TRUST_PROXY_HOPS=0` when Node is directly exposed.
 - `GEMINI_API_KEY` if live caption translation is enabled.
+- `GROQ_API_KEY` for the server-side Whisper fallback. Paste it only into the
+  Koyeb/Render secret environment settings or a local ignored `.env` file as
+  `GROQ_API_KEY=your-key`. Never paste it into `webrtc-meeting-client`,
+  `config.js`, GitHub, browser code, or chat.
+- `GROQ_TRANSCRIPTION_MODEL=whisper-large-v3-turbo`.
 - `ICE_SERVERS_JSON` to TURN credentials from a managed TURN provider. Do not
   copy static credentials from the old source file.
+- `JOIN_REQUEST_TTL_MS`, `JOIN_GRANT_TTL_MS`, and `MAX_PENDING_JOIN_REQUESTS`
+  if the default host-admission queue limits do not match the deployment.
+
+Unauthenticated `/ice` requests receive public STUN only. The client reloads
+the endpoint after Google authentication to receive configured ICE servers.
+Use short-lived TURN credentials and provider-side quotas.
+
+The Groq fallback endpoint accepts one bounded raw audio chunk per request at
+`POST /captions/transcribe`. It is authenticated with the same short-lived
+server session used by the meeting WebSocket. The browser never receives the
+Groq key.
+
+Room codes only create a join request. The host must admit each visitor before
+that visitor receives a short-lived, one-use admission grant. Admission state
+is held in memory with the room, so the canonical backend and reconnect rules
+above still apply.
 
 Update `webrtc-meeting-client/config.js` with the canonical backend URL and the
 same public Google client ID. The browser client ID is not a secret; Gemini and
-TURN credentials must never be placed in that file.
+TURN credentials must never be placed in that file. The background-filter UI
+loads the MediaPipe segmentation runtime from jsDelivr, so retain the matching
+CSP allowlist or self-host that runtime before deployment.
 
 The Google Cloud OAuth client must contain the client origin under **Authorized
 JavaScript origins**. The backend does not need a Google redirect URI because
@@ -58,3 +84,24 @@ when opened from localhost.
 
 Never commit `.env`. Rotate any Gemini or TURN credentials that were present in
 older deployments.
+
+For local development, the only permitted secret location is:
+
+```text
+webrtc-meeting-server/.env
+```
+
+Example:
+
+```env
+GROQ_API_KEY=replace-with-private-key
+```
+
+The `.env` file is ignored by Git. In production, prefer the provider's secret
+environment-variable UI instead of uploading a `.env` file.
+
+Before launch, configure the frontend host with HTTPS, HSTS, a restrictive
+Content-Security-Policy, `Referrer-Policy: no-referrer`,
+`Permissions-Policy: camera=(self), microphone=(self), display-capture=(self)`,
+`X-Content-Type-Options: nosniff`, and `X-Frame-Options: DENY`. See
+`SECURITY-REVIEW.md` for the complete launch gate and residual-risk list.
