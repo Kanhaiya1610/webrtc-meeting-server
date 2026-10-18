@@ -1303,8 +1303,10 @@ async function handleMessage(state, data) {
 
       broadcast(room, { type: 'peer_joined', ...participantState(participant, room) }, state.clientId);
       safeSend(state.ws, { type: 'room_joined', roomId, adminClientId: room.adminClientId, resumeToken: participant.resumeToken, summaryState: room.summary.state });
-      safeSend(state.ws, { type: 'room_state', adminClientId: room.adminClientId, summaryState: room.summary.state, participants: getRoomState(room, state.clientId) });
       sendYourInfo(state, room);
+      // The client must know its server-assigned clientId before it chooses
+      // the deterministic offer initiator for the room state.
+      safeSend(state.ws, { type: 'room_state', adminClientId: room.adminClientId, summaryState: room.summary.state, participants: getRoomState(room, state.clientId) });
       return;
     }
 
@@ -1340,8 +1342,8 @@ async function handleMessage(state, data) {
       touchRoom(room);
 
       safeSend(state.ws, { type: 'room_resumed', roomId: room.roomId, adminClientId: room.adminClientId, resumeToken: participant.resumeToken, summaryState: room.summary.state });
-      safeSend(state.ws, { type: 'room_state', adminClientId: room.adminClientId, summaryState: room.summary.state, participants: getRoomState(room, state.clientId) });
       sendYourInfo(state, room);
+      safeSend(state.ws, { type: 'room_state', adminClientId: room.adminClientId, summaryState: room.summary.state, participants: getRoomState(room, state.clientId) });
       if (room.adminClientId === state.clientId) sendPendingJoinRequests(room, state);
       broadcast(room, { type: 'peer_reconnected', ...participantState(participant) }, state.clientId);
       return;
