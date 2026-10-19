@@ -485,7 +485,11 @@ app.post(
       chunkNumber: Number(req.get('x-caption-chunk')) || 0
     }, connection.clientId);
 
-    return res.json({ text, provider: 'groq' });
+     return res.json({
+       text,
+       provider: 'groq',
+       captionId: `groq:${captionSession}:${captionChunk}`
+     });
   } catch (error) {
     console.error('Groq transcription request failed:', error.name === 'AbortError' ? 'timeout' : error.message);
     return sendJsonError(res, 502, 'Caption transcription provider unavailable');
@@ -1730,6 +1734,7 @@ function startServer() {
     console.log(`Meeting server listening on port ${server.address().port}`);
     console.log(`Allowed browser origins: ${Array.from(ALLOWED_ORIGINS).join(', ')}`);
     console.log(`Google authentication: ${GOOGLE_CLIENT_ID ? 'configured' : 'NOT CONFIGURED'}`);
+    console.log(`Groq transcription: ${GROQ_API_KEY ? 'configured' : 'disabled'}`);
     console.log(`Translation service: ${GEMINI_API_KEY ? 'configured' : 'disabled'}`);
   });
 }

@@ -232,7 +232,10 @@ test('authenticated Groq transcription accepts raw audio and broadcasts captions
       body: Buffer.from('fake-audio')
     });
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { text: 'hello from Groq', provider: 'groq' });
+    const transcriptionPayload = await response.json();
+    assert.equal(transcriptionPayload.text, 'hello from Groq');
+    assert.equal(transcriptionPayload.provider, 'groq');
+    assert.match(transcriptionPayload.captionId, /^groq:/);
 
     const caption = await captionPromise;
     assert.equal(await senderCaptionPromise, true);
@@ -298,7 +301,10 @@ test('resumed sessions retain HTTP authorization after reconnect', async () => {
       body: Buffer.from('fake-audio')
     });
     assert.equal(transcriptionResponse.status, 200);
-    assert.deepEqual(await transcriptionResponse.json(), { text: 'resumed caption', provider: 'groq' });
+    const transcriptionPayload = await transcriptionResponse.json();
+    assert.equal(transcriptionPayload.text, 'resumed caption');
+    assert.equal(transcriptionPayload.provider, 'groq');
+    assert.match(transcriptionPayload.captionId, /^groq:/);
   } finally {
     global.fetch = originalFetch;
     await closeSocket(resumed.ws);
